@@ -1,0 +1,60 @@
+name: Collect manual
+
+# Selten wechselnde Quellen (Häfen) -> Bucket orbis-data. Nur per "Run workflow", kein Schedule, kein Dispatch.
+# Collector: collectors/fetch-data.ts --group manual. Needs the orbis checkout (shared loaders in src/api), see README.
+
+on:
+  workflow_dispatch:
+    inputs:
+      group:
+        description: 'Sammler-Gruppe (fetch-data.ts --group)'
+        type: string
+        default: manual
+      orbis_ref:
+        description: 'Branch/Tag/SHA von malte9799/orbis für die gemeinsamen Loader'
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual
+  cancel-in-progress: false
+
+env:
+  ORBIS_REF: ${{ github.event.inputs.orbis_ref || 'main' }}
+  COLLECT_GROUP: ${{ github.event.inputs.group || 'manual' }}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: malte9799/orbis
+          ref: ${{ env.ORBIS_REF }}
+          path: orbis
+          sparse-checkout: |
+            src
+            public/data/games
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Collect manual
+        run: |
+          pnpm exec node collectors/build.mjs
+          node dist/fetch-data.mjs --group "$COLLECT_GROUP" --out out
+      - name: Upload to R2 (orbis-data)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: collectors/upload.sh out orbis-data "public, max-age=86400, stale-while-revalidate=604800"

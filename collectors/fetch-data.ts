@@ -1,6 +1,6 @@
 // Collector for sources that browsers cannot query directly (missing CORS headers) or that every visitor
-// would otherwise hit separately. Run by the group workflows in .github/workflows (live-15m, live-1h, daily, weekly):
-//   node fetch-data.mjs --group <live-15m|live-1h|daily|weekly> --out <outDir> [--only task1,task2]
+// would otherwise hit separately. Run by the group workflows in .github/workflows (live-15m, live-1h, daily, weekly, manual):
+//   node fetch-data.mjs --group <live-15m|live-1h|daily|weekly|manual> --out <outDir> [--only task1,task2]
 // Only the tasks of the given group run; how often is decided by the dispatch schedule of the clock worker.
 // A failing task keeps the previous objects (the upload never deletes). Bundled by collectors/build.mjs, which
 // resolves `@orbis/...` to the orbis checkout (see README).
@@ -19,8 +19,8 @@ const envKeys = { nps: process.env.NPS_API_KEY, windy: process.env.WINDY_KEY, vi
   removeItem() {},
 };
 
-type Group = 'live-15m' | 'live-1h' | 'daily' | 'weekly';
-const GROUPS: Group[] = ['live-15m', 'live-1h', 'daily', 'weekly'];
+type Group = 'live-15m' | 'live-1h' | 'daily' | 'weekly' | 'manual';
+const GROUPS: Group[] = ['live-15m', 'live-1h', 'daily', 'weekly', 'manual'];
 /** root of the orbis checkout, baked in by collectors/build.mjs */
 declare const __ORBIS_SRC__: string;
 
@@ -885,6 +885,25 @@ await task('osm-datacenters', 'weekly', async () => {
   write('osm-datacenters/LICENSE.txt', ODBL);
 });
 
+/**
+ * Wikidata mines / oil and gas fields for the resources layer (src/api/resources.ts): runs the app's SPARQL query and writes the
+ * packed rows ([lon, lat, Q-id, label, class, products]). Wikidata is CC0. The query service needs a descriptive User-Agent.
+ */
+await task('wikidata-resources', 'daily', async () => {
+  const res = (await import('@orbis/api/resources').catch(() => null)) as typeof import('@orbis/api/resources') | null;
+  if (!res?.packWikidata || !res.WD_SPARQL_URL) {
+    console.warn('  packWikidata missing in the orbis checkout – skipped');
+    return;
+  }
+  const answer = await fetch(res.WD_SPARQL_URL, { headers: { ...UA, Accept: 'application/sparql-results+json' }, signal: AbortSignal.timeout(120000) });
+  if (!answer.ok) throw new Error(`HTTP ${answer.status} – Wikidata SPARQL`);
+  const rows = res.packWikidata(await answer.json());
+  if (rows.length < 1000) throw new Error(`only ${rows.length} Wikidata resources – keeping previous data`);
+  const body = JSON.stringify(rows);
+  write('wikidata/resources.json', body);
+  console.log(`  ${rows.length} items, ${(body.length / 1024).toFixed(0)} KB`);
+});
+
 await task('volcanoes', 'daily', async () => {
   write(
     'volcanoes.json',
@@ -996,6 +1015,24 @@ await task('cams-world', 'daily', async () => {
 });
 
 // places with Mapillary 360° photos for the panorama game; the long crawl runs once a month
+/**
+ * WRI Global Power Plant Database (CC BY 4.0, https://github.com/wri/global-power-plant-database): the app downloaded the 12 MB CSV
+ * in every browser; the snapshot only has the rendered columns as rows [lon, lat, MW, fuel, name, country, year, owner, url].
+ */
+await task('wri-powerplants', 'weekly', async () => {
+  const infra = (await import('@orbis/api/infra').catch(() => null)) as typeof import('@orbis/api/infra') | null;
+  if (!infra?.packPowerPlants || !infra.GPPD_URL) {
+    console.warn('  packPowerPlants missing in the orbis checkout – skipped');
+    return;
+  }
+  const csv = await (await get(infra.GPPD_URL, 120000)).text();
+  const rows = infra.packPowerPlants(csv);
+  if (rows.length < 20000) throw new Error(`only ${rows.length} power plants – keeping previous data`);
+  const body = JSON.stringify(rows);
+  write('wri/powerplants.json', body);
+  console.log(`  ${rows.length} plants, CSV ${(csv.length / 1048576).toFixed(1)} MB -> JSON ${(body.length / 1048576).toFixed(2)} MB`);
+});
+
 await task('street-panos', 'weekly', async () => {
   const token = process.env.MAPILLARY_TOKEN;
   if (!token) {
@@ -1010,6 +1047,23 @@ await task('street-panos', 'weekly', async () => {
   if (data.points.length < 1000) throw new Error(`only ${data.points.length} points – keeping previous data`);
   write('street/panos.json', data);
   console.log(`  ${data.points.length} points`);
+});
+
+/**
+ * Seaports (Häfen layer, src/api/ports.ts): NGA World Port Index (US Government work, no copyright claimed) + Upply seaports
+ * (data.gouv.fr, CC BY 4.0). Both upstreams change rarely (WPI: a few updates a year, Upply: occasional), so this is a manual
+ * task (Actions -> manual -> Run workflow). Logic in collectors/ports.mjs, format = former public/data/ports.json.
+ */
+await task('ports', 'manual', async () => {
+  // @ts-expect-error plain JS module
+  const { buildPorts } = await import('./ports.mjs');
+  const WPI = 'https://msi.nga.mil/api/publications/download?key=16920959/SFH00000/UpdatedPub150.csv&type=view';
+  const UPPLY = 'https://static.data.gouv.fr/resources/seaports-locations-data/20251028-113218/upply-seaports.csv';
+  const [wpiText, upplyText] = await Promise.all([get(WPI, 120000).then((r) => r.text()), get(UPPLY, 120000).then((r) => r.text())]);
+  const { doc, fromWpi } = buildPorts(wpiText, upplyText) as { doc: { ports: unknown[] }; fromWpi: number };
+  if (fromWpi < 3000 || doc.ports.length < 8000) throw new Error(`only ${fromWpi} WPI / ${doc.ports.length} ports – keeping previous data`);
+  write('ports.json', `${JSON.stringify(doc)}\n`);
+  console.log(`  ${fromWpi} ports from the World Port Index, ${doc.ports.length - fromWpi} more from UN/LOCODE`);
 });
 
 if (GROUP === 'daily') {

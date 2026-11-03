@@ -4,7 +4,7 @@ Datenpipelines, Worker und Speicher für [Orbis](https://github.com/malte9799/or
 die Branches `data` und `data-osm` sowie die von Hand ins Dashboard kopierten Worker aus dem Orbis-Repo.
 
 Stand: Phase 1 (Fundament), Uhr-Worker `orbis-clock` und die bestehenden Sammler (`collectors/`, Workflows `live-15m`, `daily`, `weekly`, `osm-tiles`, `wetter`). Die übrigen Worker sind mit wrangler-Configs übernommen (Verhalten unverändert);
-neue Quellen (Open-Meteo-Gitter, PeeringDB, Wikidata, WRI, Autobahn …) folgen in der nächsten Phase.
+neue Quellen folgen in der nächsten Phase. Bewusst **nicht** gespiegelt (Lizenz unklar bzw. Weitergabe untersagt, App ruft live ab): PeeringDB (AUP: Daten dürfen nicht in Masse weitergegeben werden) und Autobahn-API (keine Lizenzangabe der Autobahn GmbH).
 
 ## Architektur
 
@@ -114,6 +114,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | `live-1h.yml` (`live-1h`) | :12, alle 2 h (gerade UTC-Stunden) | `fetch-data.ts --group live-1h` | `orbis-live` | 20 min |
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
+| `manual.yml` (nur *Run workflow*, kein Dispatch) | – | `fetch-data.ts --group manual` | `orbis-data` | 30 min |
 | `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `build`; eine Region ≥ 30 Tage alt, oder alle mit `all_regions`) | `orbis-osm` | je Job 350 min |
 | `wetter.yml` (`wetter`) | 03:20, 09:20, 15:20, 21:20 | `wetter-icon.py` (+ `wetter-dem.py` auf Wunsch) | `orbis-wetter` (`vars.R2_BUCKET_WETTER`) | 60 min |
 
@@ -123,8 +124,9 @@ Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine
 |---|---|
 | `live-15m` | `safecast` → `safecast.json`; `radiation` → `bfs-odl.json`, `stuk-fi.json`, `hc-ca.json`; `firms` → `firms/world.json` (nur mit `FIRMS_MAP_KEY`); `demos` → `demos.json` |
 | `live-1h` | `openmeteo-grid` → `openmeteo/global.json` (Open-Meteo-Modellraster der Weltkugel, 408 Punkte × 10 Variablen × 24 Dreistundenschritte, kompaktes JSON ~380 KB / ~110 KB gzip; 5 Multi-Location-Requests = 408 API-Aufrufe je Lauf, also bei stündlichem Lauf ~9 800/Tag bei Limit 10 000/Tag je IP, daher Lauf nur alle 2 h (~4 900/Tag); 429 pro Minute wird mit Wartezeit wiederholt). Die App liest die Datei über `VITE_LIVE_BASE` und fällt nach 3 h Alter oder bei Fehler auf Live-Abrufe zurück; das Regionalraster der Vorhersagekarte hängt vom Kartenausschnitt ab und bleibt Live-Abruf. Wetterdaten von Open-Meteo.com, CC BY 4.0 (Namensnennung nötig, kostenlose API nur nicht-kommerziell). Der Task wird übersprungen, wenn `src/api/omgrid.ts` im orbis-Checkout fehlt. |
-| `daily` | `ukraine-harm` → `ukraine-harm.json`; `ipc-gaza` → `ipc-gaza.json`; `gaza-hdx` → `gaza-displacement.json`, `healthsites-pse.json`; `ukraine-oblast` → `ukraine-oblast.json`; `osm-cables` → `osm-cables/`; `volcanoes` → `volcanoes.json`; `radio` → `radio/top.json`, `radio/cells/*.json`; `mars` → `mars/traverse.json`; `cams` → `cams/<feed>.json`; `cams-world` → `cams/world.json`; dazu `meta.json` (Zeitstempel, `camFeeds`) |
-| `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
+| `daily` | `ukraine-harm` → `ukraine-harm.json`; `ipc-gaza` → `ipc-gaza.json`; `gaza-hdx` → `gaza-displacement.json`, `healthsites-pse.json`; `ukraine-oblast` → `ukraine-oblast.json`; `osm-cables` → `osm-cables/`; `volcanoes` → `volcanoes.json`; `wikidata-resources` → `wikidata/resources.json` (Bergwerke, Öl-/Gas-/Kohlefelder aus Wikidata per SPARQL, CC0, Zeilen `[lon,lat,Q-Id,Name,Klasse,Produkte]`; die App liest sie vor dem Live-Query); `radio` → `radio/top.json`, `radio/cells/*.json`; `mars` → `mars/traverse.json`; `cams` → `cams/<feed>.json`; `cams-world` → `cams/world.json`; dazu `meta.json` (Zeitstempel, `camFeeds`) |
+| `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `wri-powerplants` → `wri/powerplants.json` (WRI Global Power Plant Database, CC BY 4.0, nur die gerenderten Spalten als Zeilen `[lon,lat,MW,Brennstoff,Name,Land,Jahr,Eigentümer,URL]`, statt 12 MB CSV je Browser); `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
+| `manual` | selten wechselnde Quellen, nur per Actions → *manual* → *Run workflow* (Input `group`, Standard `manual`): `ports` → `ports.json` (Häfen-Ebene: NGA World Port Index, US-Regierungswerk ohne Urheberrechtsanspruch, + Upply Seaports, CC BY 4.0; Format `{v:1, ports:[[lon,lat,Name,UN/LOCODE,Land,Stufe,…]]}` wie früher `public/data/ports.json`; Logik in `collectors/ports.mjs`) |
 
 Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `tsunami/PHEB.xml` alle 5 min nach `orbis-live`. Die Dateipfade sind dieselben wie bisher im `data`-Branch (`src/api/data.ts` der App liest sie unverändert); `orbis-osm` enthält PMTiles (siehe Abschnitt „OSM-Punktdaten (PMTiles)“).
 
