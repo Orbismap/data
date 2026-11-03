@@ -52,7 +52,7 @@ Geplant: D1 statt KV für `push` und `camdir`.
 
 ### Jobs der Uhr (`orbis-live`)
 
-Die Jobs stehen als Tabelle `JOBS` in `workers/clock/src/index.js` (id, url, key, every, type, cache, license). Ein Job läuft, wenn `(Minute des Tages + Hash(id)) % every === 0`; der Hash verteilt die Jobs über die Minuten (aktuell höchstens 9 Jobs pro Minute, Budget-Grenze 40 Subrequests). Pro Job: `HEAD` auf das alte Objekt, bedingte Anfrage (`If-None-Match`/`If-Modified-Since`), bei 304 kein Schreibzugriff; sonst `put` ohne Parsen. Fehler lassen das alte Objekt stehen. `manifest.json` wird nach jedem Lauf mit Schreibzugriff aus `list()` neu gebaut (Quelle/Lizenz der von GitHub Actions geschriebenen Schlüssel kommen aus der alten Manifest-Datei). Cache-Control der Objekte: `public, max-age=<every·30 s, min. 60>, stale-while-revalidate=<every·240 s>`.
+Die Jobs stehen als Tabelle `JOBS` in `workers/clock/src/index.js` (id, url, key, every, type, cache, license). Ein Job läuft, wenn `(Minute des Tages + Hash(id)) % every === 0`; der Hash verteilt die Jobs über die Minuten (aktuell höchstens 5 Jobs pro Minute, Budget-Grenze 40 Subrequests). Pro Job: `HEAD` auf das alte Objekt, bedingte Anfrage (`If-None-Match`/`If-Modified-Since`), bei 304 kein Schreibzugriff; sonst `put` ohne Parsen. Fehler lassen das alte Objekt stehen. `manifest.json` wird nach jedem Lauf mit Schreibzugriff aus `list()` neu gebaut (Quelle/Lizenz der von GitHub Actions geschriebenen Schlüssel kommen aus der alten Manifest-Datei). Cache-Control der Objekte: `public, max-age=<every·30 s, min. 60>, stale-while-revalidate=<every·240 s>`.
 
 | Job | Schlüssel in `orbis-live` | alle (min) | Lizenz |
 |---|---|---|---|
@@ -65,12 +65,12 @@ Die Jobs stehen als Tabelle `JOBS` in `workers/clock/src/index.js` (id, url, key
 | `swpc-ovation/kp/xrays` | `space/swpc/ovation_aurora_latest.json, noaa-planetary-k-index.json, xrays-1-day.json` | 5 | NOAA SWPC, gemeinfrei |
 | `ndbc-latest` | `ocean/ndbc-latest_obs.txt` | 10 | NOAA NDBC, gemeinfrei |
 | `nhc-*` | `cyclones/nhc-{point,fcst,cone,pastpt,past}.geojson` | 10 | NOAA NHC/CPHC, gemeinfrei |
-| `ll2-upcoming, ll2-tracker` | `space/launches/upcoming.json (limit=40), space/launches/tracker.json (limit=20)` | 10 (je 6/h, zusammen 12/h von 15/h) | The Space Devs, Free-Tier, Namensnennung „The Space Devs“ |
-| `celestrak-*` | `space/tle/{stations,visual,weather,science,gps-ops,galileo,starlink}.txt` | 120 | CelesTrak, frei, Namensnennung |
 
 Nicht gespiegelt: NOAA-Sonnenwind `plasma-2-hour.json`/`mag-2-hour.json` (liefern upstream 404, Ersatz wären `json/rtsw/rtsw_wind_1m.json` und `rtsw_mag_1m.json`, 1,4–2,4 MB), NWS pro Punkt (`alerts/active?point=`), alles mit Schlüssel.
 
-**Grenzen der Uhr:** Worst case ohne 304 rund 7.284 Jobläufe/Tag, das sind etwa 219.000 Class-A-Writes pro Monat plus rund 86.000 für Manifest (`list` + `put`), zusammen rund 0,3 Mio von 1 Mio. `HEAD` je Joblauf zählt als Class B (etwa 219.000/Monat von 10 Mio). Subrequests pro Minute (Fetch, `HEAD`, `put`, Manifest): höchstens 9 Jobs × 3 + 3 (Manifest: `get`, `list`, `put`) + 1 Dispatch = 31 von 50. CelesTrak liefert bei zu häufigem Abruf (innerhalb von 2 h) HTTP 403; Takt nicht verkürzen.
+**Grenzen der Uhr:** Worst case ohne 304 rund 5.472 Jobläufe/Tag, das sind etwa 164.000 Class-A-Writes pro Monat plus rund 86.000 für Manifest (`list` + `put`), zusammen rund 0,25 Mio von 1 Mio. `HEAD` je Joblauf zählt als Class B (etwa 164.000/Monat von 10 Mio). Subrequests pro Minute (Fetch, `HEAD`, `put`, Manifest): höchstens 5 Jobs × 3 + 3 (Manifest: `get`, `list`, `put`) + 1 Dispatch = 19 von 50.
+
+**Nicht auf der Uhr (GitHub Actions, Gruppe `live-15m`):** Launch Library 2 (`space/launches/upcoming.json`, `tracker.json`; 15 Requests/h pro IP) und CelesTrak (`space/tle/{stations,visual,weather,science,gps-ops,galileo,starlink}.txt`; HTTP 403 bei wiederholtem Abruf je IP) lieferten über die geteilten Cloudflare-Egress-IPs HTTP 429/403. Die Tasks `ll2-upcoming`/`ll2-tracker` (jeder Lauf, 2 Requests je 15 min = 8/h) und `celestrak` (nur im :07-Lauf geradzahliger UTC-Stunden, also alle 2 h; `--force-celestrak` bzw. Workflow-Input `force_celestrak` erzwingt) in `collectors/fetch-data.ts` schreiben die rohen Antworten unverändert unter dieselben Schlüssel. Fehlschlag oder ungültige Antwort (leer, TLE ohne Namenszeile, LL2 ohne `results`) lässt das alte Objekt stehen. Cache-Control: LL2 `public, max-age=300, stale-while-revalidate=1800`, `space/tle/` `public, max-age=3600, stale-while-revalidate=14400` (`collectors/upload.sh`, Option `--cache-prefix`).
 
 Lokal alle Jobs einmal ausführen: `pnpm exec wrangler dev -c workers/clock/wrangler.jsonc --test-scheduled --var RUN_ALL:1`, dann `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"`.
 
@@ -109,7 +109,7 @@ Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `
 - `collectors/upload.sh <dir> <bucket> <cache-control>` lädt per `aws s3 sync` (ohne `--delete`) hoch und merged die `manifest.json` des Buckets (herunterladen, `collectors/manifest.mjs`, hochladen). Ohne R2-Zugangsdaten wird nur gewarnt. `--replace-dirs` (osm-tiles) ersetzt Verzeichnisse komplett, `--collapse-manifest` fasst Kachelordner zu einem Eintrag zusammen.
 - `collectors/manifest.mjs`: Eintrag je Schlüssel `{updated, bytes, source, license}`; Quellen und Lizenzen stehen in der Tabelle `RULES` (aus `docs/DATENQUELLEN.md` der App). Für `orbis-live` bleiben die Einträge der Uhr erhalten; umgekehrt übernimmt die Uhr beim Neuaufbau `source`/`license` fremder Schlüssel aus der alten Manifest-Datei.
 
-Cache-Control beim Upload: `orbis-live` `public, max-age=300, stale-while-revalidate=1800`; `orbis-data` `public, max-age=3600, stale-while-revalidate=86400`; `orbis-osm` PMTiles/Heat/Lizenz `public, max-age=86400`, `meta.json` `public, max-age=3600`, `src/` `no-store`; `orbis-wetter` wie bisher je Schlüssel (Läufe `public, max-age=31536000, immutable`, `latest.json` `public, max-age=120`, `v1/static` `public, max-age=86400`).
+Cache-Control beim Upload: `orbis-live` `public, max-age=300, stale-while-revalidate=1800` (`space/tle/` `public, max-age=3600, stale-while-revalidate=14400`); `orbis-data` `public, max-age=3600, stale-while-revalidate=86400`; `orbis-osm` PMTiles/Heat/Lizenz `public, max-age=86400`, `meta.json` `public, max-age=3600`, `src/` `no-store`; `orbis-wetter` wie bisher je Schlüssel (Läufe `public, max-age=31536000, immutable`, `latest.json` `public, max-age=120`, `v1/static` `public, max-age=86400`).
 
 **Lokal ausführen** (ohne Upload, ohne Secrets; Quellen mit Schlüssel werden übersprungen):
 

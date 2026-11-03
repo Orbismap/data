@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Uploads a directory to an R2 bucket (S3 API) and merges its manifest.json.
-#   collectors/upload.sh <dir> <bucket> <cache-control> [--collapse-manifest] [--replace-dirs]
+#   collectors/upload.sh <dir> <bucket> <cache-control> [--collapse-manifest] [--replace-dirs] [--cache-prefix <prefix/>=<cache-control>]
 # Needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (R2 token of that bucket) and R2_ACCOUNT_ID, plus the aws CLI and node.
 # No --delete: a task that failed keeps its old objects. manifest.json is downloaded, merged with the keys of <dir>
 # (collectors/manifest.mjs) and uploaded last; for orbis-live that keeps the entries of the clock worker.
 # --replace-dirs: every top-level directory of <dir> replaces its prefix completely (sync --delete, osm-tiles: a region's
 # tiles that no longer exist disappear); loose top-level files are uploaded afterwards (tile lists, meta.json last).
+# --cache-prefix: files below <prefix/> get their own Cache-Control (synced separately, the main sync excludes the prefix).
 # Without credentials nothing is uploaded (local runs, forks).
 set -euo pipefail
 
@@ -14,8 +15,13 @@ BUCKET=${2:?bucket}
 CACHE=${3:?cache-control}
 COLLAPSE=
 REPLACE=
-for a in "${@:4}"; do
+PFX=
+PFX_CACHE=
+set -- "${@:4}"
+while [ $# -gt 0 ]; do
+  a=$1; shift
   case "$a" in
+    --cache-prefix) [ $# -gt 0 ] || { echo "--cache-prefix needs prefix/=cache-control" >&2; exit 2; }; PFX=${1%%=*}; PFX_CACHE=${1#*=}; shift ;;
     --collapse-manifest) COLLAPSE=--collapse ;;
     --replace-dirs) REPLACE=1 ;;
     *) echo "unknown option $a" >&2; exit 2 ;;
@@ -49,6 +55,9 @@ if [ -n "$REPLACE" ]; then
   aws s3 sync "$DIR" "s3://$BUCKET/" --endpoint-url "$EP" --exclude "*/*" --exclude manifest.json --exclude meta.json \
     --cache-control "$CACHE" --only-show-errors
   [ -f "$DIR/meta.json" ] && aws s3 cp "$DIR/meta.json" "s3://$BUCKET/meta.json" --endpoint-url "$EP" --cache-control "$CACHE" --only-show-errors
+elif [ -n "$PFX" ]; then
+  aws s3 sync "$DIR" "s3://$BUCKET/" --endpoint-url "$EP" --exclude manifest.json --exclude "$PFX*" --cache-control "$CACHE" --only-show-errors
+  [ -d "$DIR/$PFX" ] && aws s3 sync "$DIR/$PFX" "s3://$BUCKET/$PFX" --endpoint-url "$EP" --cache-control "$PFX_CACHE" --only-show-errors
 else
   aws s3 sync "$DIR" "s3://$BUCKET/" --endpoint-url "$EP" --exclude manifest.json --cache-control "$CACHE" --only-show-errors
 fi

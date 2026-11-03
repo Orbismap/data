@@ -14,6 +14,10 @@ on:
         description: 'Branch/Tag/SHA von malte9799/orbis für die gemeinsamen Loader'
         type: string
         default: main
+      force_celestrak:
+        description: 'CelesTrak-TLEs jetzt abrufen (sonst nur im :07-Lauf geradzahliger UTC-Stunden)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -71,10 +75,11 @@ jobs:
           MAPILLARY_TOKEN: ${{ secrets.MAPILLARY_TOKEN || vars.MAPILLARY_TOKEN }}
         run: |
           pnpm exec node collectors/build.mjs
-          node dist/fetch-data.mjs --group live-15m --out out
+          node dist/fetch-data.mjs --group live-15m --out out ${{ github.event.inputs.force_celestrak == 'true' && '--force-celestrak' || '' }}
       - name: Upload to R2 (orbis-live)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-        run: collectors/upload.sh out orbis-live "public, max-age=300, stale-while-revalidate=1800"
+        run: collectors/upload.sh out orbis-live "public, max-age=300, stale-while-revalidate=1800" \
+          --cache-prefix "space/tle/=public, max-age=3600, stale-while-revalidate=14400"

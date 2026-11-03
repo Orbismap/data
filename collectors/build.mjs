@@ -28,6 +28,10 @@ await build({
   format: 'esm',
   alias: { '@orbis': resolve(orbis, 'src') },
   nodePaths: [resolve(root, 'node_modules')],
+  // App-only deps (browser libs, not in this repo's package.json). osmtiles.ts import()s pmtiles lazily and the collector
+  // never executes that path, so leave it unresolved instead of failing the bundle (CI checkout has no node_modules).
+  // Anything else (pbf, @mapbox/vector-tile) is a real dependency here and gets bundled.
+  external: ['pmtiles'],
   define: { __ORBIS_SRC__: JSON.stringify(orbis) },
   // CJS packages (pbf, …) call require() – give the ESM bundle one
   banner: { js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);" },

@@ -24,7 +24,6 @@ const PUBLIC_DOMAIN = 'public domain';
 
 const SWPC = 'https://services.swpc.noaa.gov';
 const NHC_MAP = 'https://mapservices.weather.noaa.gov/tropical/rest/services/tropical/NHC_tropical_weather_summary/MapServer';
-const LL2 = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/';
 const JSON_T = 'application/json';
 const GEOJSON_T = 'application/geo+json';
 const XML_T = 'application/atom+xml';
@@ -95,20 +94,8 @@ export const JOBS = [
     type: GEOJSON_T,
     license: `NOAA NHC/CPHC, ${PUBLIC_DOMAIN}`,
   })),
-  // Launch Library 2: free tier allows 15 requests/h; two queries every 10 min = 12/h
-  { id: 'll2-upcoming', url: `${LL2}?limit=40&mode=detailed&hide_recent_previous=true`, key: 'space/launches/upcoming.json', every: 10, type: JSON_T, license: 'The Space Devs (Launch Library 2), free tier, attribution "The Space Devs"' },
-  { id: 'll2-tracker', url: `${LL2}?limit=20&mode=detailed`, key: 'space/launches/tracker.json', every: 10, type: JSON_T, license: 'The Space Devs (Launch Library 2), free tier, attribution "The Space Devs"' },
-
-  // ---- every 120 min ------------------------------------------------------------------------------
-  // CelesTrak asks for at most one download per data set per ~2 h; groups from SAT_GROUPS in src/api/tracking.ts
-  ...['stations', 'visual', 'weather', 'science', 'gps-ops', 'galileo', 'starlink'].map((group) => ({
-    id: `celestrak-${group}`,
-    url: `https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`,
-    key: `space/tle/${group}.txt`,
-    every: 120,
-    type: TEXT_T,
-    license: 'CelesTrak, free, attribution "CelesTrak"',
-  })),
+  // Launch Library 2 and CelesTrak are NOT mirrored here: both rate-limit per IP and the shared Cloudflare egress IPs get
+  // HTTP 429/403. They run in the GitHub Actions group live-15m (collectors/fetch-data.ts: ll2-*, celestrak) instead.
 ];
 
 // ---- GitHub Actions dispatch -------------------------------------------------------------------------

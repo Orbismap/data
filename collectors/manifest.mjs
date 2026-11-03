@@ -19,6 +19,8 @@ export const RULES = [
   [/^eurdep\.json$/, 'https://www.imis.bfs.de/ogc/opendata/ows (eurdep_latestValue)', 'EURDEP / EC JRC, free use, attribution (no explicit licence stated)'],
   [/^firms\//, 'https://firms.modaps.eosdis.nasa.gov/api', 'NASA FIRMS, free (NASA open data policy), attribution'],
   [/^demos\.json$/, 'https://api.demonstrations.org/v1/event/all', 'demonstrations.org (Demos Berlin e.V.), CC BY-SA 4.0'],
+  [/^space\/launches\//, 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/', 'The Space Devs (Launch Library 2), free tier, attribution "The Space Devs"'],
+  [/^space\/tle\//, 'https://celestrak.org/NORAD/elements/gp.php', 'CelesTrak, free, attribution'],
   [/^ccc-us\.json$/, 'https://dataverse.harvard.edu (doi:10.7910/DVN/RI9JFU)', 'Crowd Counting Consortium, CC0 1.0'],
   [/^ukraine-harm\.json$/, 'https://ukraine.bellingcat.com/', 'Bellingcat, licence not stated – attribution and link'],
   [/^ukraine-support\.json$/, 'https://www.ifw-kiel.de/topics/war-against-ukraine/ukraine-support-tracker/', 'Kiel Institute, licence not stated – attribution and link'],

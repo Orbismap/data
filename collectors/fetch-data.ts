@@ -32,8 +32,9 @@ const opt = (name: string) => {
 const GROUP = opt('group') as Group | undefined;
 const OUT = opt('out');
 const ONLY = opt('only')?.split(',').filter(Boolean);
-if (!OUT || (!GROUP && !ONLY)) throw new Error(`usage: fetch-data --group <${GROUPS.join('|')}> --out <outDir> [--only task,task]`);
+if (!OUT || (!GROUP && !ONLY)) throw new Error(`usage: fetch-data --group <${GROUPS.join('|')}> --out <outDir> [--only task,task] [--force-celestrak]`);
 if (GROUP && !GROUPS.includes(GROUP)) throw new Error(`unknown group ${GROUP}`);
+const FORCE_CELESTRAK = args.includes('--force-celestrak');
 const UA = { 'User-Agent': 'Orbis-data/1.0 (+https://github.com/malte9799/orbis)' };
 const DAY = 23 * 3600 * 1000;
 
@@ -137,6 +138,61 @@ await task('firms', 'live-15m', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Launch Library 2 + CelesTrak: formerly mirrored by the clock worker, but both limit per IP (LL2 15 req/h, CelesTrak 403 on
+// repeated downloads) and the shared Cloudflare egress IPs ran into 429/403. Same URLs and keys as before, raw bodies unchanged
+// (the app reads them via the orbis-live mirror). A failed or invalid answer writes nothing: upload.sh does not delete.
+const MIRROR_UA = { 'User-Agent': 'Orbis (+https://maltee.dev/orbis)' };
+async function rawBody(url: string): Promise<string> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const res = await fetch(url, { headers: MIRROR_UA, signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} – ${url}`);
+    const body = await res.text();
+    if (!body.trim()) throw new Error(`empty response – ${url}`);
+    return body;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+const LL2 = 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/';
+async function ll2(url: string, key: string) {
+  const body = await rawBody(url);
+  const data = JSON.parse(body) as { results?: unknown };
+  if (!Array.isArray(data.results)) throw new Error('no "results" array – keeping previous data');
+  write(key, body);
+}
+// 2 requests per run, one run per 15 min = 8/h of the 15/h allowed
+await task('ll2-upcoming', 'live-15m', () => ll2(`${LL2}?limit=40&mode=detailed&hide_recent_previous=true`, 'space/launches/upcoming.json'));
+await task('ll2-tracker', 'live-15m', () => ll2(`${LL2}?limit=20&mode=detailed`, 'space/launches/tracker.json'));
+
+// CelesTrak asks for at most one download per data set per ~2 h. The workflow has no state, so gate on the clock: live-15m is
+// dispatched at :07/:22/:37/:52, i.e. exactly the :07 run of every even UTC hour starts with minute < 15. --force-celestrak
+// (workflow_dispatch input) skips the gate; --only celestrak without the flag also respects it.
+const CELESTRAK_GROUPS = ['stations', 'visual', 'weather', 'science', 'gps-ops', 'galileo', 'starlink'];
+await task('celestrak', 'live-15m', async () => {
+  const now = new Date();
+  if (!FORCE_CELESTRAK && !(now.getUTCHours() % 2 === 0 && now.getUTCMinutes() < 15)) {
+    console.log('  celestrak: skipped (runs only at even UTC hours, minute < 15; --force-celestrak overrides)');
+    return;
+  }
+  let ok = 0;
+  for (const group of CELESTRAK_GROUPS) {
+    try {
+      const body = await rawBody(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`);
+      const lines = body.split(/\r?\n/);
+      // TLE: name line, then "1 ..." and "2 ..." lines; an error page / "No GP data found" has neither
+      if (lines[0].startsWith('1 ') || lines[0].startsWith('2 ') || !(lines[1] ?? '').startsWith('1 ') || !(lines[2] ?? '').startsWith('2 ')) throw new Error('not a TLE file (expected name line, then lines 1 and 2)');
+      write(`space/tle/${group}.txt`, body);
+      ok++;
+    } catch (e) {
+      console.warn(`  celestrak ${group}: ${e instanceof Error ? e.message : e} – keeping previous data`);
+    }
+  }
+  if (!ok) throw new Error('no CelesTrak group could be fetched');
+});
+
 // dokumentation (Zeugen-Karte): Angemeldete Versammlungen (DE/AT/CH) + US-Proteste
 
 // Angemeldete Versammlungen aus der öffentliche API von demonstrations.org (Demos Berlin e.V.)
