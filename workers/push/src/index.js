@@ -1,4 +1,4 @@
-// Push notifications for saved commuter trips of the Fahrplan (Cloudflare Worker, free plan).
+// Push notifications for saved commuter trips of the Fahrplan (Cloudflare Worker + D1, free plan).
 //
 // A PWA cannot watch a train in the background, so this worker does it: the app sends it the trips
 // the user wants to be notified about, a cron trigger (every minute) looks at the live timetable and
@@ -6,7 +6,8 @@
 // "RE 8 ist pünktlich" or "RE 8 hat 14 min Verspätung (Abfahrt: 07:26)".
 //
 // Setup: see "Fahrplan-Benachrichtigungen" in README.md. Needs
-//   • KV namespace bound as PUSH_KV
+//   • D1 database bound as DB (migrations in workers/push/migrations, see "D1" in README.md)
+//   • (temporary) KV namespace PUSH_KV, only read once to import the old data into D1
 //   • secrets VAPID_PUBLIC and VAPID_PRIVATE (node scripts/vapid-keys.mjs), variable VAPID_SUBJECT
 //     ("mailto:you@example.org")
 //   • cron trigger "* * * * *"
@@ -378,46 +379,133 @@ export function cleanTrips(list) {
   return out;
 }
 
-// ---- storage ---------------------------------------------------------------------------
-// 'subs' holds every subscription with its trips (written only by the HTTP routes). What the cron has sent
-// lives in one key per subscription, so a cron run never overwrites a subscription that changed meanwhile.
+// ---- storage ---------------------------------------------------------------------------------
+// D1 tables (workers/push/migrations): subscriptions, trips (one row per trip, `notify_at` = start of the next open
+// notification window), sent (what the cron has sent), meta (marker of the KV import). Every write touches only the
+// rows of one subscription, so concurrent syncs of different devices cannot overwrite each other.
 
-const load = async (env) => (await env.PUSH_KV.get('subs', 'json')) ?? {};
-const save = (env, doc) => env.PUSH_KV.put('subs', JSON.stringify(doc));
-const loadSent = async (env, id) => (await env.PUSH_KV.get(`sent:${id}`, 'json')) ?? {};
-async function subId(endpoint) {
+export async function subId(endpoint) {
   return b64uEnc(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(endpoint)))).slice(0, 22);
 }
-/** forgets a subscription (re-read right before writing, so concurrent changes of others survive) */
-async function forget(env, id) {
-  const doc = await load(env);
-  if (doc[id]) {
-    delete doc[id];
-    await save(env, doc);
+
+/**
+ * Start (ms) of the earliest notification window of `trip` that has not ended at `now`, or null.
+ * Windows are the same as in dueNotifications: [dep − lead, min(dep − lead + grace, dep)).
+ */
+export function nextNotifyAt(trip, tz, now) {
+  const [h, mi] = trip.hm.split(':').map(Number);
+  const t = zoned(now, tz);
+  let best = null;
+  for (let off = 0; off <= 8; off++) {
+    const dep = instantAt(t.y, t.m, t.d + off, h, mi, tz);
+    if (!trip.days.includes(zoned(dep, tz).wd)) continue;
+    for (const lead of trip.leads) {
+      const from = dep - lead * 60000;
+      if (now < Math.min(from + GRACE_MS, dep) && (best === null || from < best)) best = from;
+    }
+    if (best !== null) break; // later days start later
   }
-  await env.PUSH_KV.delete(`sent:${id}`);
+  return best;
+}
+
+/** statements that replace the trips of a subscription (all in one batch with the caller's other statements) */
+function tripStatements(env, id, trips, tz, now) {
+  const rows = trips.map((t) => ({ k: t.id, d: JSON.stringify(t), n: nextNotifyAt(t, t.tz || tz, now) }));
+  return [
+    env.DB.prepare('DELETE FROM trips WHERE sub_id = ?1').bind(id),
+    env.DB.prepare("INSERT OR REPLACE INTO trips (sub_id, trip_key, data, notify_at) SELECT ?1, json_extract(value, '$.k'), json_extract(value, '$.d'), json_extract(value, '$.n') FROM json_each(?2)").bind(id, JSON.stringify(rows)),
+  ];
+}
+
+const dedupeTrips = (trips) => [...new Map(trips.map((t) => [t.id, t])).values()];
+
+/** forgets a subscription with everything that belongs to it */
+function forgetStatements(env, id) {
+  return [env.DB.prepare('DELETE FROM trips WHERE sub_id = ?1').bind(id), env.DB.prepare('DELETE FROM sent WHERE sub_id = ?1').bind(id), env.DB.prepare('DELETE FROM subscriptions WHERE id = ?1').bind(id)];
+}
+const forget = (env, id) => env.DB.batch(forgetStatements(env, id));
+
+// ---- one-time import from the old KV keys -------------------------------------------------------
+// TODO(KV-Import): about a week after the D1 rollout delete this block, the ensureImported() calls and the PUSH_KV
+// binding in wrangler.jsonc (the `meta` table stays harmlessly; see "D1" in README.md).
+//
+// The first request/cron run that finds no marker in `meta` copies KV `subs` and `sent:<id>` into D1. All statements
+// are guarded by "marker not set yet" and run in one batch (one transaction): when two isolates import at the same
+// time the second batch does nothing, and it can never bring back a subscription that was removed after the first
+// import. INSERT OR IGNORE keeps every statement idempotent.
+const NOT_IMPORTED = "NOT EXISTS (SELECT 1 FROM meta WHERE k = 'kv_import')";
+const importing = new WeakMap();
+
+async function importFromKv(env, now = Date.now()) {
+  if (await env.DB.prepare("SELECT 1 AS x FROM meta WHERE k = 'kv_import'").first()) return;
+  const doc = (await env.PUSH_KV.get('subs', 'json')) ?? {};
+  const stmts = [];
+  const ids = []; // [id in KV, id in D1] – the same unless the old key was not the hash of the endpoint
+  for (const [kvId, s] of Object.entries(doc)) {
+    if (ids.length >= MAX_SUBS) break;
+    const trips = dedupeTrips(Array.isArray(s?.trips) ? s.trips.slice(0, MAX_TRIPS) : []);
+    if (!pushEndpoint(s?.sub?.endpoint) || !s.sub.keys || !trips.length) continue;
+    const tz = validTz(s.tz) ? s.tz : 'Europe/Berlin';
+    const t = Number.isFinite(s.t) ? s.t : now;
+    const id = await subId(s.sub.endpoint);
+    ids.push([kvId, id]);
+    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO subscriptions (id, endpoint, keys, tz, created_at, updated_at) SELECT ?1, ?2, ?3, ?4, ?5, ?5 WHERE ${NOT_IMPORTED}`).bind(id, s.sub.endpoint, JSON.stringify(s.sub.keys), tz, t));
+    const rows = trips.map((tr) => ({ k: tr.id, d: JSON.stringify(tr), n: nextNotifyAt(tr, tr.tz || tz, now) }));
+    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO trips (sub_id, trip_key, data, notify_at) SELECT ?1, json_extract(value, '$.k'), json_extract(value, '$.d'), json_extract(value, '$.n') FROM json_each(?2) WHERE ${NOT_IMPORTED}`).bind(id, JSON.stringify(rows)));
+  }
+  // what was sent in the last days, so nothing is sent twice around the switch (reads in small groups)
+  for (let i = 0; i < ids.length; i += 10) {
+    const group = ids.slice(i, i + 10);
+    const sents = await Promise.all(group.map(([kvId]) => env.PUSH_KV.get(`sent:${kvId}`, 'json').catch(() => null)));
+    group.forEach(([, id], j) => {
+      const recent = Object.fromEntries(Object.entries(sents[j] ?? {}).filter(([, v]) => Number.isFinite(v) && now - v <= KEEP_SENT_MS));
+      if (Object.keys(recent).length) stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO sent (sub_id, key, sent_at) SELECT ?1, key, value FROM json_each(?2) WHERE ${NOT_IMPORTED}`).bind(id, JSON.stringify(recent)));
+    });
+  }
+  stmts.push(env.DB.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('kv_import', ?1)").bind(String(now)));
+  await env.DB.batch(stmts);
+}
+
+function ensureImported(env) {
+  if (!env.PUSH_KV) return Promise.resolve(); // binding removed: nothing to import any more
+  let p = importing.get(env.DB);
+  if (!p) {
+    p = importFromKv(env);
+    importing.set(env.DB, p);
+    p.catch(() => importing.delete(env.DB)); // try again with the next request
+  }
+  return p;
 }
 
 // ---- cron -----------------------------------------------------------------------------------
 
 export async function runDue(env, now = Date.now()) {
-  const doc = await load(env);
+  await ensureImported(env);
+  // only trips with an open (or just opened) notification window; the others are not read at all
+  const { results } = await env.DB.prepare('SELECT t.sub_id, t.data, t.notify_at, s.endpoint, s.keys, s.tz FROM trips t JOIN subscriptions s ON s.id = t.sub_id WHERE t.notify_at <= ?1 ORDER BY t.sub_id LIMIT 600').bind(now).all();
+  const bySub = new Map();
+  for (const r of results) {
+    if (!bySub.has(r.sub_id)) bySub.set(r.sub_id, { sub: { endpoint: r.endpoint, keys: JSON.parse(r.keys) }, tz: r.tz, rows: [] });
+    bySub.get(r.sub_id).rows.push(r);
+  }
   const budget = newBudget();
   const cache = new Map();
   const gone = [];
-  run: for (const [id, s] of Object.entries(doc)) {
+  const writes = [];
+  run: for (const [id, s] of bySub) {
     let sent = null; // loaded only when something is due at all
-    let dirty = false;
-    for (const trip of s.trips) {
-      for (const due of dueNotifications(trip, trip.tz || s.tz, now, {})) {
-        sent ??= await loadSent(env, id);
+    for (const row of s.rows) {
+      const trip = JSON.parse(row.data);
+      const tz = trip.tz || s.tz;
+      for (const due of dueNotifications(trip, tz, now, {})) {
+        sent ??= Object.fromEntries((await env.DB.prepare('SELECT key, sent_at FROM sent WHERE sub_id = ?1').bind(id).all()).results.map((x) => [x.key, x.sent_at]));
         if (sent[due.key]) continue;
         if (budget.left <= 0) break run; // the rest is tried again next minute (inside the grace window)
         const ck = `${trip.from.id}|${trip.to.id}|${trip.line}|${due.dep}`;
         if (!cache.has(ck)) cache.set(ck, liveStatus(trip, due.dep, env, budget).catch(() => null));
         const status = await cache.get(ck);
         if (!status) continue; // not found / service down: try again next minute
-        const msg = buildMessage(trip, status, trip.tz || s.tz);
+        const msg = buildMessage(trip, status, tz);
         if (!msg) continue; // on time and only delays wanted: keep looking until the grace window ends
         let code = 0;
         try {
@@ -427,26 +515,21 @@ export async function runDue(env, now = Date.now()) {
         }
         if (code === 404 || code === 410) {
           gone.push(id); // the user revoked the permission or uninstalled the app
-          dirty = false;
           continue run;
         }
         if (code >= 200 && code < 300) {
           sent[due.key] = now;
-          dirty = true;
+          writes.push(env.DB.prepare('INSERT OR REPLACE INTO sent (sub_id, key, sent_at) VALUES (?1, ?2, ?3)').bind(id, due.key, now));
         }
       }
-    }
-    if (sent) {
-      for (const [k, t] of Object.entries(sent)) {
-        if (now - t > KEEP_SENT_MS) {
-          delete sent[k];
-          dirty = true;
-        }
-      }
-      if (dirty) await env.PUSH_KV.put(`sent:${id}`, JSON.stringify(sent));
+      // move the trip on to its next open window (this one itself while it is still open)
+      const next = nextNotifyAt(trip, tz, now);
+      if (next !== row.notify_at) writes.push(env.DB.prepare('UPDATE trips SET notify_at = ?3 WHERE sub_id = ?1 AND trip_key = ?2 AND notify_at IS ?4').bind(id, trip.id, next, row.notify_at));
     }
   }
-  for (const id of gone) await forget(env, id);
+  writes.push(env.DB.prepare('DELETE FROM sent WHERE sent_at < ?1').bind(now - KEEP_SENT_MS));
+  for (const id of gone) writes.push(...forgetStatements(env, id));
+  if (writes.length) await env.DB.batch(writes);
 }
 
 // ---- HTTP ---------------------------------------------------------------------------------------
@@ -518,32 +601,33 @@ async function handle(req, env, url) {
   if (typeof endpoint !== 'string' || !pushEndpoint(endpoint)) return 400;
   if (limited(`write|${ip}`, 30, 60000)) return 429;
   const id = await subId(endpoint);
-  const doc = await load(env);
+  await ensureImported(env);
   if (url.pathname === '/sync') {
     const sub = body.subscription;
     if (!validSub(sub) || !validTz(body.tz)) return 400;
-    const trips = cleanTrips(body.trips);
+    const trips = dedupeTrips(cleanTrips(body.trips));
     if (!trips.length) {
-      delete doc[id];
-      await env.PUSH_KV.delete(`sent:${id}`);
+      await forget(env, id);
     } else {
-      if (!doc[id] && Object.keys(doc).length >= MAX_SUBS) return 507;
-      doc[id] = { sub: { endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } }, tz: body.tz, trips, t: Date.now() };
+      const known = await env.DB.prepare('SELECT 1 AS x FROM subscriptions WHERE id = ?1').bind(id).first();
+      if (!known && (await env.DB.prepare('SELECT COUNT(*) AS n FROM subscriptions').first()).n >= MAX_SUBS) return 507;
+      const now = Date.now();
+      await env.DB.batch([
+        env.DB.prepare('INSERT INTO subscriptions (id, endpoint, keys, tz, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(id) DO UPDATE SET endpoint = excluded.endpoint, keys = excluded.keys, tz = excluded.tz, updated_at = excluded.updated_at').bind(id, endpoint, JSON.stringify({ p256dh: sub.keys.p256dh, auth: sub.keys.auth }), body.tz, now),
+        ...tripStatements(env, id, trips, body.tz, now),
+      ]);
     }
-    await save(env, doc);
     return { ok: true, trips: trips.length };
   }
   if (url.pathname === '/unsubscribe') {
-    delete doc[id];
-    await save(env, doc);
-    await env.PUSH_KV.delete(`sent:${id}`);
+    await forget(env, id);
     return { ok: true };
   }
   if (url.pathname === '/test') {
-    const s = doc[id];
-    if (!s) return 404;
+    const row = await env.DB.prepare('SELECT endpoint, keys FROM subscriptions WHERE id = ?1').bind(id).first();
+    if (!row) return 404;
     if (limited(`test|${id}`, 1, 10000)) return 429;
-    const code = await sendPush(env, s.sub, { title: 'Orbis Fahrplan', body: 'Benachrichtigungen funktionieren.', tag: 'test', url: './#/fahrplan' }).catch(() => 0);
+    const code = await sendPush(env, { endpoint: row.endpoint, keys: JSON.parse(row.keys) }, { title: 'Orbis Fahrplan', body: 'Benachrichtigungen funktionieren.', tag: 'test', url: './#/fahrplan' }).catch(() => 0);
     if (code === 404 || code === 410) await forget(env, id);
     return code >= 200 && code < 300 ? { ok: true } : 502;
   }

@@ -7,8 +7,12 @@
   "keep_vars": true, // schützt nur im Dashboard gesetzte Variablen, die NICHT in dieser Datei stehen
   "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" },
   "triggers": { "crons": ["* * * * *"] },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "orbis-push", "database_id": "aa4b53d8-a690-4130-81ec-a36b01dd2d11", "migrations_dir": "migrations" }
+  ],
   "kv_namespaces": [
-    { "binding": "PUSH_KV", "id": "8b4b18a63cef4b83ac733f8b334fa9c9" } // KV "orbis-push"
+    // TODO(KV-Import, ca. eine Woche nach dem D1-Rollout): Binding samt Import-Code in src/index.js entfernen, siehe README "D1"
+    { "binding": "PUSH_KV", "id": "8b4b18a63cef4b83ac733f8b334fa9c9" } // KV "orbis-push", nur noch für den einmaligen Import
   ]
   // Im Dashboard setzen (nicht hier):
   //   Secrets: DB_CLIENT_ID, DB_API_KEY, VAPID_PUBLIC, VAPID_PRIVATE

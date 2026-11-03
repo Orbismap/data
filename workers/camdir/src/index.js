@@ -1,10 +1,10 @@
-// Camera viewing directions for Orbis (Cloudflare Worker + KV, free plan).
+// Camera viewing directions for Orbis (Cloudflare Worker + D1, free plan).
 //
 // Corrected viewing directions of webcams: the map reads them (GET /dirs) and draws the view cone and
 // the 3D board with them; the right-hand camera panel writes them. Writing needs the admin token.
 //
 // Setup (see "Kamera-Richtungen" in README.md):
-//   1. Workers & Pages → KV → create a namespace, bind it to the worker as CAMDIR
+//   1. D1 database "orbis-camdir" bound as DB (migrations: workers/camdir/migrations, see "D1" in README.md)
 //   2. Settings → Variables and Secrets: secret ADMIN_TOKEN (a long random string),
 //      optional variable ALLOWED_ORIGINS (comma separated, e.g. https://malte9799.github.io)
 //
@@ -13,11 +13,10 @@
 //   PUT    /dirs   {key, dir, pose?: {down, alt, roll, fov}, pos?: [lng, lat]} → sets one direction and optionally the pose and a moved position (Authorization: Bearer <ADMIN_TOKEN>)
 //   DELETE /dirs?key=<key>        → removes the correction        (Authorization: Bearer <ADMIN_TOKEN>)
 //
-// Prepared for suggestions by every visitor (later): POST /suggest would store into a separate KV key
+// Prepared for suggestions by every visitor (later): POST /suggest would store into a separate table
 // ("suggestions") with a rate limit; the admin accepts them with the PUT above. The GET answer and
 // the client do not change for that.
 
-const KEY = 'dirs';
 const MAX_ENTRIES = 20000;
 const KEY_RE = /^[\w.:@,|/ -]{1,120}$/;
 
@@ -51,6 +50,49 @@ async function isAdmin(request, env) {
   return !!env.ADMIN_TOKEN && !!given && (await sameToken(given, env.ADMIN_TOKEN));
 }
 
+// ---- one-time import from the old KV key ---------------------------------------------------
+// TODO(KV-Import): about a week after the D1 rollout delete this block, the ensureImported() calls, the
+// CAMDIR binding in wrangler.jsonc and the `meta` table is then unused (see "D1" in README.md).
+//
+// The first request that finds no marker in `meta` copies the KV object `dirs` into the table. All statements
+// are guarded by "marker not set yet" and run in one batch (one transaction), so two isolates importing at the
+// same time cannot overwrite what was written after the first import. INSERT OR IGNORE keeps it idempotent.
+const NOT_IMPORTED = "NOT EXISTS (SELECT 1 FROM meta WHERE k = 'kv_import')";
+const importing = new WeakMap();
+
+async function importFromKv(env) {
+  const done = await env.DB.prepare("SELECT 1 AS x FROM meta WHERE k = 'kv_import'").first();
+  if (done) return;
+  const old = (await env.CAMDIR.get('dirs', 'json')) ?? {};
+  const entries = Object.entries(old).filter(([k, v]) => KEY_RE.test(k) && v && typeof v === 'object');
+  const stmts = [];
+  // chunks of 400 entries as one JSON object each, unpacked by json_each (keeps statements and parameters small)
+  for (let i = 0; i < entries.length; i += 400) {
+    const chunk = Object.fromEntries(entries.slice(i, i + 400));
+    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO dirs (key, value, updated_at) SELECT key, value, json_extract(value, '$.at') FROM json_each(?1) WHERE ${NOT_IMPORTED}`).bind(JSON.stringify(chunk)));
+  }
+  stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO meta (k, v) VALUES ('kv_import', ?1)`).bind(String(Date.now())));
+  await env.DB.batch(stmts);
+}
+
+function ensureImported(env) {
+  if (!env.CAMDIR) return Promise.resolve(); // binding removed: nothing to import any more
+  let p = importing.get(env.DB);
+  if (!p) {
+    p = importFromKv(env);
+    importing.set(env.DB, p);
+    p.catch(() => importing.delete(env.DB)); // try again with the next request
+  }
+  return p;
+}
+
+// ---- storage -----------------------------------------------------------------------------------
+
+const readAll = async (env) => {
+  const { results } = await env.DB.prepare('SELECT key, value FROM dirs').all();
+  return Object.fromEntries(results.map((r) => [r.key, JSON.parse(r.value)]));
+};
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') ?? '';
@@ -61,11 +103,12 @@ export default {
 
     const url = new URL(request.url);
     if (!url.pathname.endsWith('/dirs')) return json({ error: 'not found' }, 404, headers);
-    if (!env.CAMDIR) return json({ error: 'KV namespace CAMDIR is not bound' }, 500, headers);
+    if (!env.DB) return json({ error: 'D1 database DB is not bound' }, 500, headers);
 
-    const read = async () => (await env.CAMDIR.get(KEY, 'json')) ?? {};
-
-    if (request.method === 'GET') return json({ dirs: await read() }, 200, headers, { 'Cache-Control': 'public, max-age=60' });
+    if (request.method === 'GET') {
+      await ensureImported(env);
+      return json({ dirs: await readAll(env) }, 200, headers, { 'Cache-Control': 'public, max-age=60' });
+    }
 
     if (request.method !== 'PUT' && request.method !== 'DELETE') return json({ error: 'method not allowed' }, 405, headers);
     if (!(await isAdmin(request, env))) return json({ error: 'unauthorized' }, 401, headers);
@@ -73,9 +116,8 @@ export default {
     if (request.method === 'DELETE') {
       const key = url.searchParams.get('key') ?? '';
       if (!KEY_RE.test(key)) return json({ error: 'bad key' }, 400, headers);
-      const dirs = await read();
-      delete dirs[key];
-      await env.CAMDIR.put(KEY, JSON.stringify(dirs));
+      await ensureImported(env);
+      await env.DB.prepare('DELETE FROM dirs WHERE key = ?1').bind(key).run();
       return json({ ok: true }, 200, headers);
     }
 
@@ -87,8 +129,9 @@ export default {
     }
     const dir = Number(body?.dir);
     if (!KEY_RE.test(String(body?.key ?? '')) || !Number.isFinite(dir) || dir < 0 || dir >= 360) return json({ error: 'bad key or dir' }, 400, headers);
-    const dirs = await read();
-    if (!(body.key in dirs) && Object.keys(dirs).length >= MAX_ENTRIES) return json({ error: 'too many entries' }, 413, headers);
+    await ensureImported(env);
+    const exists = await env.DB.prepare('SELECT 1 AS x FROM dirs WHERE key = ?1').bind(body.key).first();
+    if (!exists && (await env.DB.prepare('SELECT COUNT(*) AS n FROM dirs').first()).n >= MAX_ENTRIES) return json({ error: 'too many entries' }, 413, headers);
     const entry = { d: Math.round(dir * 10) / 10, at: Date.now() };
     // optional pose of the camera (tilt below the horizon, height above the ground, roll, vertical field of view): the 3D view needs it
     const p = body.pose;
@@ -104,8 +147,7 @@ export default {
       if (!(Math.abs(lng) <= 180 && Math.abs(lat) <= 90)) return json({ error: 'bad pos' }, 400, headers);
       entry.pos = [Math.round(lng * 1e6) / 1e6, Math.round(lat * 1e6) / 1e6];
     }
-    dirs[body.key] = entry;
-    await env.CAMDIR.put(KEY, JSON.stringify(dirs));
+    await env.DB.prepare('INSERT INTO dirs (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').bind(body.key, JSON.stringify(entry), entry.at).run();
     return json({ ok: true }, 200, headers);
   },
 };

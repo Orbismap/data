@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fakeD1 } from '../d1-fake';
 // @ts-expect-error – plain JS worker file, deployed on its own
-import worker, { buildMessage, cleanTrips, dbDelays, dbStamp, dueNotifications, instantAt, limited, matchDelay, parseStations, parseTimetable, pickStation, pushEndpoint, runDue, vapidAuth, zoned } from './src/index.js';
+import worker, { buildMessage, cleanTrips, dbDelays, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, runDue, subId, vapidAuth, zoned } from './src/index.js';
 
 const TZ = 'Europe/Berlin';
 const stop = (name: string) => ({ id: `id-${name}`, name, lat: 53.7, lon: 11.4, src: 'db' });
@@ -208,32 +209,64 @@ describe('subrequest budget', () => {
   });
 });
 
-describe('cron and routes (stubbed KV, push service and Transitous)', () => {
+describe('nextNotifyAt', () => {
+  const at = (iso: string) => Date.parse(iso);
+  it('is the start of the earliest window that has not ended', () => {
+    // Thursday 2026-10-29, 07:12 CET = 06:12Z, leads 30/20/10 -> first window opens 05:42Z
+    expect(new Date(nextNotifyAt(trip(), TZ, at('2026-10-29T04:00:00Z'))!).toISOString()).toBe('2026-10-29T05:42:00.000Z');
+    // inside the window of lead 30 it stays at that start, once it ended the window of lead 20 is next
+    expect(new Date(nextNotifyAt(trip(), TZ, at('2026-10-29T05:44:00Z'))!).toISOString()).toBe('2026-10-29T05:42:00.000Z');
+    expect(new Date(nextNotifyAt(trip(), TZ, at('2026-10-29T05:47:00Z'))!).toISOString()).toBe('2026-10-29T05:52:00.000Z');
+  });
+  it('jumps to the next matching weekday after departure', () => {
+    // Friday 2026-10-30 is a weekday too
+    expect(new Date(nextNotifyAt(trip(), TZ, at('2026-10-29T06:30:00Z'))!).toISOString()).toBe('2026-10-30T05:42:00.000Z');
+    // Saturday: only Monday counts
+    expect(new Date(nextNotifyAt(trip(), TZ, at('2026-10-31T06:30:00Z'))!).toISOString()).toBe('2026-11-02T05:42:00.000Z');
+  });
+});
+
+describe('cron and routes (D1 on node:sqlite, stubbed KV, push service and Transitous)', () => {
   const NOW = Date.parse('2026-10-29T06:02:00Z'); // 10 min before 07:12 CET
   const EP = 'https://fcm.googleapis.com/fcm/send/abc';
-  afterEach(() => vi.unstubAllGlobals());
+  const EP2 = 'https://fcm.googleapis.com/fcm/send/def';
+  // /sync stamps notify_at with the clock: pin it to the test's "now"
+  beforeEach(() => vi.useFakeTimers({ toFake: ['Date'], now: NOW - 3600000 }));
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 
   const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  async function setup() {
+  const migration = new URL('./migrations/0001_init.sql', import.meta.url).pathname;
+  const fakeKv = (data: Record<string, unknown> = {}) => {
+    const kv = new Map<string, string>(Object.entries(data).map(([k, v]) => [k, JSON.stringify(v)]));
+    return {
+      store: kv,
+      get: async (k: string) => (kv.has(k) ? JSON.parse(kv.get(k)!) : null),
+      put: async (k: string, v: string) => void kv.set(k, v),
+      delete: async (k: string) => void kv.delete(k),
+    };
+  };
+  async function setup(withKv?: Record<string, unknown>) {
     const ecdh = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
     const p256dh = b64u(new Uint8Array(await crypto.subtle.exportKey('raw', ecdh.publicKey)));
     const vk = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
-    const kv = new Map<string, string>();
-    const env = {
+    const db = fakeD1([migration]);
+    const kv = withKv ? fakeKv(withKv) : undefined;
+    const env: Record<string, unknown> = {
       VAPID_PUBLIC: 'pub',
       VAPID_PRIVATE: JSON.stringify(await crypto.subtle.exportKey('jwk', vk.privateKey)),
-      PUSH_KV: {
-        get: async (k: string) => (kv.has(k) ? JSON.parse(kv.get(k)!) : null),
-        put: async (k: string, v: string) => void kv.set(k, v),
-        delete: async (k: string) => void kv.delete(k),
-      },
+      DB: db,
+      ...(kv ? { PUSH_KV: kv } : {}),
     };
     const sub = { endpoint: EP, keys: { p256dh, auth: b64u(new TextEncoder().encode('0123456789abcdef')) } };
     const call = async (path: string, body: unknown) => {
       const res = await worker.fetch(new Request(`https://w.example${path}`, { method: 'POST', body: JSON.stringify(body) }), env);
       return res.status;
     };
-    return { env, kv, sub, call };
+    const count = (table: string) => (db.raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+    return { env, db, kv, sub, call, count };
   }
   const tripBody = (over = {}) => ({ ...trip({ leads: [10], from: { ...stop('A'), src: 'motis' }, to: { ...stop('B'), src: 'motis' } }), ...over });
   const transitous = () =>
@@ -248,16 +281,38 @@ describe('cron and routes (stubbed KV, push service and Transitous)', () => {
     return pushes;
   };
 
-  it('sends once, remembers it in its own key and does not touch the subscriptions', async () => {
-    const { env, kv, sub, call } = await setup();
+  it('sends once and remembers it in the sent table without touching the subscriptions', async () => {
+    const { env, db, sub, call, count } = await setup();
     expect(await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] })).toBe(200);
-    const subsBefore = kv.get('subs');
+    const before = JSON.stringify(db.raw.prepare('SELECT * FROM subscriptions').all());
     const pushes = serve([201]);
     await runDue(env, NOW);
     await runDue(env, NOW + 60000);
     expect(pushes).toHaveLength(1);
-    expect(kv.get('subs')).toBe(subsBefore);
-    expect(Object.keys(JSON.parse([...kv].find(([k]) => k.startsWith('sent:'))![1]))).toHaveLength(1);
+    expect(JSON.stringify(db.raw.prepare('SELECT * FROM subscriptions').all())).toBe(before);
+    expect(count('sent')).toBe(1);
+  });
+  it('dedupes: a notification already in sent is not sent again, also by a later cron run', async () => {
+    const { env, sub, call, count } = await setup();
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] });
+    const pushes = serve([201]);
+    for (let i = 0; i < 4; i++) await runDue(env, NOW + i * 60000);
+    expect(pushes).toHaveLength(1);
+    expect(count('sent')).toBe(1);
+  });
+  it('reads only trips whose notification window is open', async () => {
+    const { env, sub, call, db } = await setup();
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] });
+    const f = vi.fn(async () => new Response('', { status: 201 }));
+    vi.stubGlobal('fetch', f);
+    await runDue(env, Date.parse('2026-10-29T01:00:00Z')); // hours before the window
+    expect(f).not.toHaveBeenCalled();
+    const row = db.raw.prepare('SELECT notify_at FROM trips').get() as { notify_at: number };
+    expect(new Date(row.notify_at).toISOString()).toBe('2026-10-29T06:02:00.000Z'); // 10 min before 07:12 CET
+    // after departure it moves on to the next weekday
+    serve([201]);
+    await runDue(env, Date.parse('2026-10-29T06:30:00Z'));
+    expect(new Date((db.raw.prepare('SELECT notify_at FROM trips').get() as { notify_at: number }).notify_at).toISOString()).toBe('2026-10-30T06:02:00.000Z');
   });
   it('tries again next minute when the push service fails', async () => {
     const { env, sub, call } = await setup();
@@ -281,11 +336,57 @@ describe('cron and routes (stubbed KV, push service and Transitous)', () => {
     expect(pushes).toHaveLength(0);
   });
   it('forgets a subscription the push service reports as gone', async () => {
-    const { env, kv, sub, call } = await setup();
+    const { env, sub, call, count } = await setup();
     await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] });
     serve([410]);
     await runDue(env, NOW);
-    expect(JSON.parse(kv.get('subs')!)).toEqual({});
+    expect([count('subscriptions'), count('trips'), count('sent')]).toEqual([0, 0, 0]);
+  });
+  it('prunes sent entries older than three days', async () => {
+    const { env, db, sub, call } = await setup();
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] });
+    const id = (db.raw.prepare('SELECT id FROM subscriptions').get() as { id: string }).id;
+    db.raw.prepare('INSERT INTO sent VALUES (?, ?, ?)').run(id, 'old', NOW - 4 * 86400000);
+    db.raw.prepare('INSERT INTO sent VALUES (?, ?, ?)').run(id, 'new', NOW - 86400000);
+    serve([201]);
+    await runDue(env, NOW);
+    expect((db.raw.prepare('SELECT key FROM sent ORDER BY key').all() as { key: string }[]).map((r) => r.key).filter((k) => k === 'old' || k === 'new')).toEqual(['new']);
+  });
+  it('keeps two subscriptions that sync at the same time', async () => {
+    const { sub, call, count } = await setup();
+    const other = { ...sub, endpoint: EP2 };
+    const codes = await Promise.all([call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] }), call('/sync', { subscription: other, tz: TZ, trips: [tripBody({ id: 't9' })] })]);
+    expect(codes).toEqual([200, 200]);
+    expect([count('subscriptions'), count('trips')]).toEqual([2, 2]);
+  });
+  it('replaces the trips of a subscription on a new sync and unsubscribes', async () => {
+    const { sub, call, count, db } = await setup();
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody({ id: 'a' }), tripBody({ id: 'b' }), tripBody({ id: 'b' })] });
+    expect(count('trips')).toBe(2);
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody({ id: 'c' })] });
+    expect((db.raw.prepare('SELECT trip_key FROM trips').all() as { trip_key: string }[]).map((r) => r.trip_key)).toEqual(['c']);
+    expect(await call('/unsubscribe', { endpoint: EP })).toBe(200);
+    expect([count('subscriptions'), count('trips')]).toEqual([0, 0]);
+    // an empty trip list forgets as well
+    await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] });
+    expect(await call('/sync', { subscription: sub, tz: TZ, trips: [] })).toBe(200);
+    expect(count('subscriptions')).toBe(0);
+  });
+  it('answers the same shapes as before', async () => {
+    const { env, sub } = await setup();
+    const post = async (path: string, body: unknown) => {
+      const r = await worker.fetch(new Request(`https://w.example${path}`, { method: 'POST', body: JSON.stringify(body) }), env);
+      return { status: r.status, text: await r.text() };
+    };
+    expect(await post('/sync', { subscription: sub, tz: TZ, trips: [tripBody(), tripBody({ id: 'x' })] })).toEqual({ status: 200, text: '{"ok":true,"trips":2}' });
+    expect(await post('/unsubscribe', { endpoint: EP })).toEqual({ status: 200, text: '{"ok":true}' });
+    expect(await post('/test', { endpoint: EP })).toEqual({ status: 404, text: '404' });
+  });
+  it('refuses the 501st subscription', async () => {
+    const { sub, call, db } = await setup();
+    const ins = db.raw.prepare("INSERT INTO subscriptions VALUES (?, ?, '{}', 'UTC', 1, 1)");
+    for (let i = 0; i < 500; i++) ins.run(`s${i}`, `https://fcm.googleapis.com/${i}`);
+    expect(await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] })).toBe(507);
   });
   it('rejects foreign endpoints and a too fast /test', async () => {
     const { sub, call } = await setup();
@@ -300,5 +401,57 @@ describe('cron and routes (stubbed KV, push service and Transitous)', () => {
     const a = await vapidAuth(env, EP, NOW);
     expect(await vapidAuth(env, EP, NOW + 60000)).toBe(a);
     expect(await vapidAuth(env, EP, NOW + 12 * 3600000)).not.toBe(a);
+  });
+
+  describe('one-time import from KV', () => {
+    const oldDoc = async () => {
+      const { sub } = await setup();
+      const id = await subId(sub.endpoint);
+      return { id, doc: { [id]: { sub, tz: TZ, trips: [tripBody()], t: 1700000000000 } }, sub };
+    };
+    it('copies subs and recent sent keys once and is idempotent', async () => {
+      const { id, doc, sub } = await oldDoc();
+      const key = `t1|2026-10-29|10`;
+      const { env, db, count } = await setup({ subs: doc, [`sent:${id}`]: { [key]: NOW - 1000, stale: NOW - 5 * 86400000 } });
+      serve([201]);
+      await runDue(env, NOW);
+      expect([count('subscriptions'), count('trips'), count('sent')]).toEqual([1, 1, 1]); // 'stale' is not taken over, the old notification counts as sent -> no push
+      expect((db.raw.prepare('SELECT endpoint FROM subscriptions').get() as { endpoint: string }).endpoint).toBe(sub.endpoint);
+      expect(vi.mocked(fetch)).not.toHaveBeenCalledWith(expect.stringContaining('fcm'), expect.anything());
+      // a second isolate (fresh module state is simulated by a second import call on the same database) changes nothing
+      db.raw.prepare('DELETE FROM subscriptions').run();
+      db.raw.prepare('DELETE FROM trips').run();
+      await worker.scheduled({}, { ...env, DB: db }, { waitUntil: (p: Promise<void>) => p });
+      expect(count('subscriptions')).toBe(0); // the removed subscription does not come back
+      expect((db.raw.prepare("SELECT COUNT(*) AS n FROM meta WHERE k = 'kv_import'").get() as { n: number }).n).toBe(1);
+    });
+    it('survives two imports racing each other', async () => {
+      const { doc } = await oldDoc();
+      const { env, db, count } = await setup({ subs: doc });
+      // two "isolates" = two env objects over the same database
+      const env2 = { ...env, DB: Object.create(env.DB as object, {}) };
+      const get = (e: any) => e.PUSH_KV.get('subs');
+      expect(await get(env)).toBeTruthy();
+      serve([201]);
+      await Promise.all([runDue(env, 0), runDue(env2, 0)]);
+      expect([count('subscriptions'), count('trips')]).toEqual([1, 1]);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM meta').get() as { n: number }).n).toBe(1);
+    });
+    it('works without the KV binding (after the cleanup)', async () => {
+      const { env, call, sub, count } = await setup();
+      expect(env.PUSH_KV).toBeUndefined();
+      expect(await call('/sync', { subscription: sub, tz: TZ, trips: [tripBody()] })).toBe(200);
+      expect(count('subscriptions')).toBe(1);
+    });
+    it('does not bring back an imported subscription that was unsubscribed afterwards', async () => {
+      const { doc, sub } = await oldDoc();
+      const { env, call, count } = await setup({ subs: doc });
+      expect(await call('/sync', { subscription: { ...sub, endpoint: EP2 }, tz: TZ, trips: [tripBody({ id: 'n' })] })).toBe(200);
+      expect(count('subscriptions')).toBe(2); // the imported one plus the new one
+      await call('/unsubscribe', { endpoint: EP });
+      await runDue(env, NOW);
+      await call('/test', { endpoint: EP });
+      expect(count('subscriptions')).toBe(1);
+    });
   });
 });

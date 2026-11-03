@@ -6,8 +6,12 @@
   "workers_dev": true,
   "keep_vars": true, // schützt nur im Dashboard gesetzte Variablen, die NICHT in dieser Datei stehen
   "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "orbis-camdir", "database_id": "207c8fd0-555f-4268-aff6-888053ef9fbb", "migrations_dir": "migrations" }
+  ],
   "kv_namespaces": [
-    { "binding": "CAMDIR", "id": "e053eae9163d47da8c8b3f6a28c1115d" } // KV "orbis_cams"
+    // TODO(KV-Import, ca. eine Woche nach dem D1-Rollout): Binding samt Import-Code in src/index.js entfernen, siehe README "D1"
+    { "binding": "CAMDIR", "id": "e053eae9163d47da8c8b3f6a28c1115d" } // KV "orbis_cams", nur noch für den einmaligen Import
   ]
   // Im Dashboard setzen (nicht hier): Secret ADMIN_TOKEN
 }
