@@ -16,7 +16,8 @@ const OSM = 'OpenStreetMap (Overpass API)';
 export const RULES = [
   [/^safecast\.json$/, 'https://tt.safecast.org/devices', 'Safecast, CC0 1.0'],
   [/^bfs-odl\.json$/, 'https://www.imis.bfs.de/ogc/opendata/ows (odlinfo_odl_1h_latest)', 'BfS ODL-Messnetz, Datenlizenz Deutschland 2.0 (DL-DE 2.0)'],
-  [/^eurdep\.json$/, 'https://www.imis.bfs.de/ogc/opendata/ows (eurdep_latestValue)', 'EURDEP / EC JRC, free use, attribution (no explicit licence stated)'],
+  [/^stuk-fi\.json$/, 'https://opendata.fmi.fi/wfs (stuk::observations::external-radiation::latest::multipointcoverage)', 'STUK / Finnish Meteorological Institute, CC BY 4.0, attribution "Säteilyturvakeskus STUK / Ilmatieteen laitos (FMI)" (https://en.ilmatieteenlaitos.fi/open-data-licence)'],
+  [/^hc-ca\.json$/, 'https://maps-cartes.services.geo.ca/server_serveur/rest/services/HC/fpsn_en/MapServer/1', 'Health Canada Fixed Point Surveillance Network, Open Government Licence – Canada, attribution "Health Canada" (https://open.canada.ca/en/open-government-licence-canada)'],
   [/^firms\//, 'https://firms.modaps.eosdis.nasa.gov/api', 'NASA FIRMS, free (NASA open data policy), attribution'],
   [/^demos\.json$/, 'https://api.demonstrations.org/v1/event/all', 'demonstrations.org (Demos Berlin e.V.), CC BY-SA 4.0'],
   [/^space\/launches\//, 'https://ll.thespacedevs.com/2.3.0/launches/upcoming/', 'The Space Devs (Launch Library 2), free tier, attribution "The Space Devs"'],

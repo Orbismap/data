@@ -97,7 +97,7 @@ Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine
 
 | Gruppe | Task → Dateien in R2 |
 |---|---|
-| `live-15m` | `safecast` → `safecast.json`; `radiation` → `bfs-odl.json`, `eurdep.json`; `firms` → `firms/world.json` (nur mit `FIRMS_MAP_KEY`); `demos` → `demos.json` |
+| `live-15m` | `safecast` → `safecast.json`; `radiation` → `bfs-odl.json`, `stuk-fi.json`, `hc-ca.json`; `firms` → `firms/world.json` (nur mit `FIRMS_MAP_KEY`); `demos` → `demos.json` |
 | `daily` | `ukraine-harm` → `ukraine-harm.json`; `ipc-gaza` → `ipc-gaza.json`; `gaza-hdx` → `gaza-displacement.json`, `healthsites-pse.json`; `ukraine-oblast` → `ukraine-oblast.json`; `osm-cables` → `osm-cables/`; `volcanoes` → `volcanoes.json`; `radio` → `radio/top.json`, `radio/cells/*.json`; `mars` → `mars/traverse.json`; `cams` → `cams/<feed>.json`; `cams-world` → `cams/world.json`; dazu `meta.json` (Zeitstempel, `camFeeds`) |
 | `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
 

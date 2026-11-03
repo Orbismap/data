@@ -90,13 +90,32 @@ await task('safecast', 'live-15m', async () => {
 });
 
 await task('radiation', 'live-15m', async () => {
-  const { fetchBfsRaw, fetchEurdepRaw } = await import('@orbis/api/earth');
-  const [bfs, eurdep] = await Promise.allSettled([fetchBfsRaw(), fetchEurdepRaw()]);
-  if (bfs.status === 'fulfilled') write('bfs-odl.json', bfs.value);
-  else console.warn(`  BfS ODL: ${bfs.reason} – keeping previous data`);
-  if (eurdep.status === 'fulfilled') write('eurdep.json', eurdep.value);
-  else console.warn(`  EURDEP: ${eurdep.reason} – keeping previous data`);
-  if (bfs.status === 'rejected' && eurdep.status === 'rejected') throw new Error('BfS and EURDEP failed');
+  // the STUK/Health Canada helpers only exist in orbis main once the radiation PR is merged – older checkouts: skip softly
+  const earth = (await import('@orbis/api/earth')) as Record<string, unknown>;
+  const fetchers: [string, string, string | null][] = [
+    ['BfS ODL', 'fetchBfsRaw', 'bfs-odl.json'],
+    ['STUK (FI)', 'fetchStukStations', 'stuk-fi.json'],
+    ['Health Canada', 'fetchHcStations', 'hc-ca.json'],
+  ];
+  let ok = 0;
+  let tried = 0;
+  for (const [label, fn, file] of fetchers) {
+    const fetcher = earth[fn];
+    if (typeof fetcher !== 'function') {
+      console.warn(`  ${label}: ${fn} missing in the orbis checkout – skipped`);
+      continue;
+    }
+    tried++;
+    try {
+      const data = (await (fetcher as () => Promise<unknown>)()) as unknown[] | { features?: unknown[] };
+      write(file!, data);
+      ok++;
+      console.log(`  ${label}: ${Array.isArray(data) ? data.length : (data.features?.length ?? '?')} stations`);
+    } catch (e) {
+      console.warn(`  ${label}: ${e instanceof Error ? e.message : e} – keeping previous data`);
+    }
+  }
+  if (tried && !ok) throw new Error('all radiation sources failed');
 });
 
 await task('firms', 'live-15m', async () => {
