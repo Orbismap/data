@@ -1,0 +1,15 @@
+{
+  // Fahrplan-Push (heute https://orbis-trains.malte9799.workers.dev/). Der Name darf sich nicht ändern.
+  "name": "orbis-trains",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "keep_vars": true,
+  "triggers": { "crons": ["* * * * *"] },
+  "kv_namespaces": [
+    { "binding": "PUSH_KV", "id": "8b4b18a63cef4b83ac733f8b334fa9c9" } // KV "orbis-push"
+  ]
+  // Im Dashboard setzen (nicht hier):
+  //   Secrets: DB_CLIENT_ID, DB_API_KEY, VAPID_PUBLIC, VAPID_PRIVATE
+  //   Text:    VAPID_SUBJECT (mailto:...), ALLOWED_ORIGINS (optional), DB_TIMETABLES_BASE (optional)
+}

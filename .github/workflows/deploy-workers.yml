@@ -1,0 +1,96 @@
+name: Deploy Workers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "workers/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/deploy-workers.yml"
+  workflow_dispatch:
+    inputs:
+      worker:
+        description: "Welcher Worker? (all, proxy, push, camdir, clock)"
+        default: all
+        type: choice
+        options: [all, proxy, push, camdir, clock]
+
+concurrency:
+  group: deploy-workers
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      workers: ${{ steps.pick.outputs.workers }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'push'
+        with:
+          filters: |
+            shared:
+              - "package.json"
+              - "pnpm-lock.yaml"
+              - ".github/workflows/deploy-workers.yml"
+            proxy:
+              - "workers/proxy/**"
+            push:
+              - "workers/push/**"
+            camdir:
+              - "workers/camdir/**"
+            clock:
+              - "workers/clock/**"
+      - id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT: ${{ inputs.worker }}
+          SHARED: ${{ steps.filter.outputs.shared }}
+          PROXY: ${{ steps.filter.outputs.proxy }}
+          PUSH: ${{ steps.filter.outputs.push }}
+          CAMDIR: ${{ steps.filter.outputs.camdir }}
+          CLOCK: ${{ steps.filter.outputs.clock }}
+        run: |
+          list=()
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$INPUT" = "all" ]; then list=(proxy push camdir clock); else list=("$INPUT"); fi
+          elif [ "$SHARED" = "true" ]; then
+            list=(proxy push camdir clock)
+          else
+            [ "$PROXY" = "true" ] && list+=(proxy)
+            [ "$PUSH" = "true" ] && list+=(push)
+            [ "$CAMDIR" = "true" ] && list+=(camdir)
+            [ "$CLOCK" = "true" ] && list+=(clock)
+          fi
+          json=$(printf '%s\n' "${list[@]}" | jq -R . | jq -sc .)
+          [ ${#list[@]} -eq 0 ] && json='[]'
+          echo "workers=$json" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: changes
+    if: needs.changes.outputs.workers != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: ${{ fromJSON(needs.changes.outputs.workers) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          packageManager: pnpm
+          workingDirectory: workers/${{ matrix.worker }}
+          command: deploy

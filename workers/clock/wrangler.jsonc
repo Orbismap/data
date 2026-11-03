@@ -1,0 +1,16 @@
+{
+  // Uhr: spiegelt kleine Upstream-Feeds roh nach R2 (Bucket "orbis-live", öffentlich über https://orbis-live.maltee.dev).
+  // Kein HTTP-Einsatz, daher ohne workers.dev-Adresse; der fetch-Handler antwortet nur mit 404.
+  "name": "orbis-clock",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "keep_vars": true,
+  "triggers": { "crons": ["* * * * *"] },
+  "r2_buckets": [
+    { "binding": "LIVE", "bucket_name": "orbis-live" }
+  ]
+  // Im Dashboard setzen (nicht hier):
+  //   Secret: GH_DISPATCH_TOKEN (optional, erst für GitHub-Actions-Jobs nötig; fine-grained PAT mit "Contents: write" auf Orbismap/data)
+  //   Lokal testen: --var RUN_ALL:1 lässt jeden Job einmal laufen
+}

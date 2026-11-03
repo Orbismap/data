@@ -1,0 +1,11 @@
+{
+  // Daten-Proxy (heute https://orbis.malte9799.workers.dev/). Der Name darf sich nicht ändern, sonst ändert sich die URL.
+  "name": "orbis",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "keep_vars": true // im Dashboard gesetzte Variablen überleben Deploys
+  // Variablen/Secrets im Dashboard setzen (hier NICHT als Werte, sonst überschreibt der Deploy sie):
+  //   ALLOWED_ORIGINS  Text, kommagetrennte Liste erlaubter Origins
+  //   AISSTREAM_KEY    Secret, optional (Schiffe weltweit)
+}

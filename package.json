@@ -1,0 +1,14 @@
+{
+  "name": "orbis-data",
+  "private": true,
+  "description": "Datenpipelines, Worker und Speicher für Orbis",
+  "scripts": {
+    "deploy:proxy": "wrangler deploy -c workers/proxy/wrangler.jsonc",
+    "deploy:push": "wrangler deploy -c workers/push/wrangler.jsonc",
+    "deploy:camdir": "wrangler deploy -c workers/camdir/wrangler.jsonc",
+    "deploy:clock": "wrangler deploy -c workers/clock/wrangler.jsonc"
+  },
+  "devDependencies": {
+    "wrangler": "4.157.0"
+  }
+}

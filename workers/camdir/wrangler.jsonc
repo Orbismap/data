@@ -1,0 +1,12 @@
+{
+  // Kamera-Richtungen (heute https://orbis-cams.malte9799.workers.dev/). Der Name darf sich nicht ändern.
+  "name": "orbis-cams",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "keep_vars": true,
+  "kv_namespaces": [
+    { "binding": "CAMDIR", "id": "e053eae9163d47da8c8b3f6a28c1115d" } // KV "orbis_cams"
+  ]
+  // Im Dashboard setzen (nicht hier): Secret ADMIN_TOKEN, Text ALLOWED_ORIGINS (optional)
+}
