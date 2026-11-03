@@ -1,6 +1,6 @@
 // Collector for sources that browsers cannot query directly (missing CORS headers) or that every visitor
-// would otherwise hit separately. Run by the group workflows in .github/workflows (live-15m, daily, weekly):
-//   node fetch-data.mjs --group <live-15m|daily|weekly> --out <outDir> [--only task1,task2]
+// would otherwise hit separately. Run by the group workflows in .github/workflows (live-15m, live-1h, daily, weekly):
+//   node fetch-data.mjs --group <live-15m|live-1h|daily|weekly> --out <outDir> [--only task1,task2]
 // Only the tasks of the given group run; how often is decided by the dispatch schedule of the clock worker.
 // A failing task keeps the previous objects (the upload never deletes). Bundled by collectors/build.mjs, which
 // resolves `@orbis/...` to the orbis checkout (see README).
@@ -19,8 +19,8 @@ const envKeys = { nps: process.env.NPS_API_KEY, windy: process.env.WINDY_KEY, vi
   removeItem() {},
 };
 
-type Group = 'live-15m' | 'daily' | 'weekly';
-const GROUPS: Group[] = ['live-15m', 'daily', 'weekly'];
+type Group = 'live-15m' | 'live-1h' | 'daily' | 'weekly';
+const GROUPS: Group[] = ['live-15m', 'live-1h', 'daily', 'weekly'];
 /** root of the orbis checkout, baked in by collectors/build.mjs */
 declare const __ORBIS_SRC__: string;
 
@@ -81,6 +81,51 @@ async function task(name: string, group: Group, fn: () => Promise<void>) {
     console.warn(`✗ ${name}: ${e instanceof Error ? e.message : e} – keeping previous data`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// live-1h
+
+/**
+ * Open-Meteo model grid for the app's globe (src/api/omgrid.ts): 408 locations in 5 multi-location requests, two at a time,
+ * written as one compact snapshot (openmeteo/global.json). Weather data by Open-Meteo.com, CC BY 4.0. Free API limits:
+ * 600 calls/min, 5 000/h, 10 000/day (a location counts as one call) – one run costs 408. 429 per minute: wait and retry.
+ * The regional grid of the forecast map depends on the viewport and stays a live request in the app.
+ */
+async function omJson<T>(url: string): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: UA, signal: AbortSignal.timeout(60000) });
+    if (res.ok) return (await res.json()) as T;
+    const body = await res.text().catch(() => '');
+    const retry = res.status === 429 ? /minut/i.test(body) : res.status >= 500;
+    if (!retry || attempt >= 3) throw new Error(`HTTP ${res.status} – Open-Meteo ${body.slice(0, 160)}`);
+    const wait = res.status === 429 ? 62000 : 5000 * 2 ** attempt;
+    console.warn(`  Open-Meteo HTTP ${res.status}, retry in ${Math.round(wait / 1000)} s`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+await task('openmeteo-grid', 'live-1h', async () => {
+  // omgrid only exists in orbis main once the Open-Meteo snapshot PR is merged – older checkouts: skip softly
+  const om = (await import('@orbis/api/omgrid').catch(() => null)) as typeof import('@orbis/api/omgrid') | null;
+  if (!om) {
+    console.warn('  src/api/omgrid.ts missing in the orbis checkout – skipped');
+    return;
+  }
+  const points = om.gridPoints(om.GLOBAL_GRID);
+  const reqs = om.forecastUrls(points);
+  const rows: (import('@orbis/api/omgrid').HourlyRow[] | undefined)[] = new Array(reqs.length);
+  let calls = 0;
+  await pool(reqs, 2, async (r) => {
+    const idx = reqs.indexOf(r);
+    const out = await omJson<import('@orbis/api/omgrid').HourlyRow | import('@orbis/api/omgrid').HourlyRow[]>(r.url);
+    calls += r.count;
+    rows[idx] = Array.isArray(out) ? out : [out];
+  });
+  const snap = om.buildSnapshot(om.GLOBAL_GRID, rows.flatMap((x) => x ?? []));
+  const body = JSON.stringify(snap);
+  write('openmeteo/global.json', body);
+  console.log(`  ${points.length} points, ${snap.vars.length} variables, ${snap.n} steps, ${reqs.length} requests (${calls} API calls), ${(body.length / 1024).toFixed(0)} KB`);
+});
 
 // ---------------------------------------------------------------------------
 // live-15m

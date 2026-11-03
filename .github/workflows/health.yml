@@ -1,0 +1,33 @@
+name: Health
+
+# Stündliche Prüfung der Datenaktualität (collectors/health.mjs). Gestartet von der Uhr (workers/clock) per
+# repository_dispatch, type `health`, Minute :45; manuell über "Run workflow".
+# Bei Problemen: ein Issue "Datenstatus: Probleme" (Label `health`); wieder ok -> Kommentar + geschlossen.
+
+on:
+  repository_dispatch:
+    types: [health]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node collectors/health.mjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}

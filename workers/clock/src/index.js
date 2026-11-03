@@ -105,6 +105,11 @@ export const JOBS = [
 // Each dispatch is one subrequest (counted in run()). Collectors: collectors/ and .github/workflows in this repo.
 export const DISPATCH = [
   { id: 'live-15m', event: 'live-15m', minutes: [7, 22, 37, 52] }, // every 15 min (same minutes as the old data.yml cron)
+  // Event/workflow keep the name `live-1h`, but it runs every 2 hours (even UTC hours): the Open-Meteo grid costs 408 API calls
+  // per run, hourly that is ~9,800/day against the free limit of 10,000/day per IP, and GitHub runner IPs are shared.
+  // Every 2 h = ~4,900/day.
+  { id: 'live-1h', event: 'live-1h', hours: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22], minutes: [12] },
+  { id: 'health', event: 'health', minutes: [45] }, // hourly staleness check (collectors/health.mjs), opens/closes the issue "Datenstatus: Probleme"
   { id: 'daily', event: 'daily', hours: [3], minutes: [5] },
   { id: 'weekly', event: 'weekly', days: [1], hours: [4], minutes: [5] }, // Mondays
   { id: 'osm-tiles', event: 'osm-tiles', hours: [3], minutes: [17] },

@@ -33,7 +33,7 @@ Hosts einstufig unter `*.maltee.dev` (das kostenlose Zertifikat deckt nur eine E
 | `orbis-assets` | `orbis-assets.maltee.dev` | `models/`, `textures/`, große Teile von `public/data` | `immutable` unter Hash-Pfaden, `index.json` kurz | Lifecycle: nicht mehr referenzierte Hash-Pfade nach 90 Tagen |
 
 - Pro Bucket ein eigenes R2-API-Token (Actions-Jobs bekommen nur Schreibrecht auf "ihren" Bucket).
-- CORS je Bucket: `GET`/`HEAD` von der App-Domain und `http://localhost:5173`.
+- CORS je Bucket (alle fünf identisch, per `wrangler r2 bucket cors set`): `AllowedOrigins *`, Methoden `GET`/`HEAD`, erlaubte Header `*` (u. a. `Range` für PMTiles), freigegeben `ETag`, `Content-Length`, `Content-Range`, `Last-Modified`, `MaxAge 86400`. Die Daten sind öffentlich und ohne Cookies, daher kein Origin-Filter. Cloudflare-CDN-Antworten, die vor der Änderung gecacht wurden, haben den Header evtl. erst nach Ablauf der TTL.
 - Jeder Bucket hat eine `manifest.json` (Pfad → `updated`, `etag`, `bytes`, `source`, `license`).
 - `wx-worker.js` wird **nicht** migriert: Der Wetter-Bucket ist direkt über die Custom Domain `orbis-wetter.maltee.dev` erreichbar, der alte Worker und der alte Bucket werden nach der Umstellung gelöscht.
 
@@ -111,6 +111,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | Workflow (`event_type`) | Dispatch (UTC) | Sammler | Ziel-Bucket | Timeout |
 |---|---|---|---|---|
 | `live-15m.yml` (`live-15m`) | :07, :22, :37, :52 | `fetch-data.ts --group live-15m` | `orbis-live` | 35 min |
+| `live-1h.yml` (`live-1h`) | :12, alle 2 h (gerade UTC-Stunden) | `fetch-data.ts --group live-1h` | `orbis-live` | 20 min |
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
 | `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `build`; eine Region ≥ 30 Tage alt, oder alle mit `all_regions`) | `orbis-osm` | je Job 350 min |
@@ -121,6 +122,7 @@ Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine
 | Gruppe | Task → Dateien in R2 |
 |---|---|
 | `live-15m` | `safecast` → `safecast.json`; `radiation` → `bfs-odl.json`, `stuk-fi.json`, `hc-ca.json`; `firms` → `firms/world.json` (nur mit `FIRMS_MAP_KEY`); `demos` → `demos.json` |
+| `live-1h` | `openmeteo-grid` → `openmeteo/global.json` (Open-Meteo-Modellraster der Weltkugel, 408 Punkte × 10 Variablen × 24 Dreistundenschritte, kompaktes JSON ~380 KB / ~110 KB gzip; 5 Multi-Location-Requests = 408 API-Aufrufe je Lauf, also bei stündlichem Lauf ~9 800/Tag bei Limit 10 000/Tag je IP, daher Lauf nur alle 2 h (~4 900/Tag); 429 pro Minute wird mit Wartezeit wiederholt). Die App liest die Datei über `VITE_LIVE_BASE` und fällt nach 3 h Alter oder bei Fehler auf Live-Abrufe zurück; das Regionalraster der Vorhersagekarte hängt vom Kartenausschnitt ab und bleibt Live-Abruf. Wetterdaten von Open-Meteo.com, CC BY 4.0 (Namensnennung nötig, kostenlose API nur nicht-kommerziell). Der Task wird übersprungen, wenn `src/api/omgrid.ts` im orbis-Checkout fehlt. |
 | `daily` | `ukraine-harm` → `ukraine-harm.json`; `ipc-gaza` → `ipc-gaza.json`; `gaza-hdx` → `gaza-displacement.json`, `healthsites-pse.json`; `ukraine-oblast` → `ukraine-oblast.json`; `osm-cables` → `osm-cables/`; `volcanoes` → `volcanoes.json`; `radio` → `radio/top.json`, `radio/cells/*.json`; `mars` → `mars/traverse.json`; `cams` → `cams/<feed>.json`; `cams-world` → `cams/world.json`; dazu `meta.json` (Zeitstempel, `camFeeds`) |
 | `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
 
