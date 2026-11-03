@@ -10,9 +10,11 @@
 // nothing (saves a R2 Class A write), on 2xx put the body. A failing job keeps the old object and never
 // stops the other jobs. After a run that wrote something, manifest.json is rebuilt from LIST + customMetadata.
 //
-// Setup: R2 binding LIVE (bucket orbis-live), cron "* * * * *". Optional secret GH_DISPATCH_TOKEN (see DISPATCH).
+// Heavy jobs are not run here: DISPATCH below starts the GitHub Actions workflows of Orbismap/data (repository_dispatch).
+//
+// Setup: R2 binding LIVE (bucket orbis-live), cron "* * * * *". Secret GH_DISPATCH_TOKEN for DISPATCH (README: fine-grained PAT).
 // Local: `pnpm exec wrangler dev -c workers/clock/wrangler.jsonc --test-scheduled --var RUN_ALL:1`, then
-// `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` – RUN_ALL runs every job once.
+// `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` – RUN_ALL runs every mirror job once (and dispatches nothing).
 
 const UA = 'Orbis (+https://maltee.dev/orbis)';
 const TIMEOUT_MS = 20000;
@@ -109,14 +111,37 @@ export const JOBS = [
   })),
 ];
 
-// ---- GitHub Actions dispatch (NOT USED YET) -----------------------------------------------------------
-// Heavy jobs run in GitHub Actions (Orbismap/data), the clock only starts them on time. Same schedule rule as JOBS.
-// Entry: { id, every /* minutes */, event /* repository_dispatch event_type */, payload /* client_payload */ }
-const DISPATCH = [];
+// ---- GitHub Actions dispatch -------------------------------------------------------------------------
+// Heavy jobs run in GitHub Actions (Orbismap/data); the clock only starts them on time (UTC, from the scheduled event).
+// Entry: { id, event /* repository_dispatch event_type = workflow */, payload /* client_payload */,
+//          minutes: [..], hours?: [..] /* default every hour */, days?: [..] /* 0 = Sunday .. 6, default every day */ }
+// Each dispatch is one subrequest (counted in run()). Collectors: collectors/ and .github/workflows in this repo.
+export const DISPATCH = [
+  { id: 'live-15m', event: 'live-15m', minutes: [7, 22, 37, 52] }, // every 15 min (same minutes as the old data.yml cron)
+  { id: 'daily', event: 'daily', hours: [3], minutes: [5] },
+  { id: 'weekly', event: 'weekly', days: [1], hours: [4], minutes: [5] }, // Mondays
+  { id: 'osm-tiles', event: 'osm-tiles', hours: [3], minutes: [17] },
+  { id: 'wetter', event: 'wetter', hours: [3, 9, 15, 21], minutes: [20] }, // ICON runs 00/06/12/18 UTC are complete ~3 h later
+];
 
-/** repository_dispatch to Orbismap/data; skipped silently without the secret GH_DISPATCH_TOKEN */
+/** dispatch entries due at this time (UTC); all of them with runAll */
+export function dispatchDue(table, date, runAll = false) {
+  return table.filter(
+    (d) => runAll || (d.minutes.includes(date.getUTCMinutes()) && (d.hours ?? [date.getUTCHours()]).includes(date.getUTCHours()) && (d.days ?? [date.getUTCDay()]).includes(date.getUTCDay())),
+  );
+}
+
+let warnedNoToken = false;
+
+/** repository_dispatch to Orbismap/data; without the secret GH_DISPATCH_TOKEN it logs once per isolate and returns false */
 export async function dispatch(env, event, payload = {}) {
-  if (!env.GH_DISPATCH_TOKEN) return false;
+  if (!env.GH_DISPATCH_TOKEN) {
+    if (!warnedNoToken) {
+      warnedNoToken = true;
+      console.warn('[clock] secret GH_DISPATCH_TOKEN missing - GitHub Actions jobs are not started');
+    }
+    return false;
+  }
   const res = await fetch('https://api.github.com/repos/Orbismap/data/dispatches', {
     method: 'POST',
     headers: {
@@ -129,7 +154,11 @@ export async function dispatch(env, event, payload = {}) {
     body: JSON.stringify({ event_type: event, client_payload: payload }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`dispatch ${event}: HTTP ${res.status}`);
+  if (!res.ok) {
+    res.body?.cancel();
+    throw new Error(`dispatch ${event}: HTTP ${res.status}`);
+  }
+  res.body?.cancel(); // 204 No Content
   return true;
 }
 
@@ -193,7 +222,18 @@ async function mirror(env, job) {
   return 'written';
 }
 
+/**
+ * Rebuilds manifest.json from LIST. Objects written by the GitHub Actions workflows have no customMetadata (aws s3 sync),
+ * so source and license of those keys come from the previous manifest, which the workflows merge their entries into
+ * (collectors/upload.sh). Subrequests: get + list + put.
+ */
 async function writeManifest(env) {
+  let old = {};
+  try {
+    old = (await (await env.LIVE.get(MANIFEST_KEY))?.json()) ?? {};
+  } catch {
+    // unreadable or missing: start over, the next workflow run fills source/license again
+  }
   const manifest = {};
   let cursor;
   do {
@@ -201,7 +241,8 @@ async function writeManifest(env) {
     for (const o of page.objects) {
       if (o.key === MANIFEST_KEY) continue;
       const m = o.customMetadata ?? {};
-      manifest[o.key] = { updated: m.fetched || o.uploaded.toISOString(), bytes: o.size, source: m.source ?? '', license: m.license ?? '' };
+      const prev = old[o.key] ?? {};
+      manifest[o.key] = { updated: m.fetched || o.uploaded.toISOString(), bytes: o.size, source: m.source ?? prev.source ?? '', license: m.license ?? prev.license ?? '' };
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
@@ -216,10 +257,24 @@ export async function run(env, scheduledTime = Date.now()) {
   const minute = t.getUTCHours() * 60 + t.getUTCMinutes();
   const runAll = env.RUN_ALL === '1' || env.RUN_ALL === 1;
 
-  // budget: head + fetch + put per job (worst case 3), manifest needs list + put (+ pagination, ignored)
+  // GitHub Actions dispatches: one subrequest each, only counted when the token exists (otherwise nothing is sent).
+  // Not in RUN_ALL: a local test run must not start the real workflows.
+  const dispatches = runAll ? [] : dispatchDue(DISPATCH, t);
+  const dispatching = env.GH_DISPATCH_TOKEN ? dispatches.length : 0;
+  const dispatched = Promise.allSettled(
+    dispatches.map(async (d) => {
+      try {
+        if (await dispatch(env, d.event, d.payload)) console.log(`[clock] dispatched ${d.event}`);
+      } catch (e) {
+        console.error(`[clock] ${d.id} failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }),
+  );
+
+  // budget: head + fetch + put per job (worst case 3), manifest needs get + list + put (+ pagination, ignored), dispatches 1 each
   const due = dueAt(JOBS, minute, runAll);
   const jobs = [];
-  let used = 3; // manifest reserve
+  let used = 3 + dispatching; // manifest + dispatch reserve
   for (const j of due) {
     if (!runAll && used + 3 > MAX_SUBREQUESTS) {
       console.warn(`[clock] subrequest budget: skipping ${j.id} at minute ${minute}`);
@@ -228,7 +283,7 @@ export async function run(env, scheduledTime = Date.now()) {
     used += 3;
     jobs.push(j);
   }
-  if (due.length * 3 + 3 > MAX_SUBREQUESTS) console.warn(`[clock] minute ${minute}: ${due.length} jobs due, worst case ${due.length * 3 + 3} subrequests`);
+  if (due.length * 3 + 3 + dispatching > MAX_SUBREQUESTS) console.warn(`[clock] minute ${minute}: ${due.length} jobs due, worst case ${due.length * 3 + 3 + dispatching} subrequests`);
 
   const results = await Promise.allSettled(
     jobs.map(async (job) => {
@@ -244,14 +299,7 @@ export async function run(env, scheduledTime = Date.now()) {
     }),
   );
 
-  // GitHub Actions jobs (none yet)
-  for (const d of dueAt(DISPATCH, minute, runAll)) {
-    try {
-      await dispatch(env, d.event, d.payload);
-    } catch (e) {
-      console.error(`[clock] ${d.id} failed: ${e instanceof Error ? e.message : e}`);
-    }
-  }
+  await dispatched;
 
   const written = results.filter((r) => r.status === 'fulfilled' && r.value === 'written').length;
   const failed = results.filter((r) => r.status === 'rejected').length;

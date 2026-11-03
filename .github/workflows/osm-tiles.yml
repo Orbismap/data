@@ -1,0 +1,65 @@
+name: OSM tiles
+
+# Kamera-Dichte (CCTV) und weitere OSM-Punktkacheln (Blitzer, ALPR, Webcams, Windräder, Ressourcen) aus Geofabrik-Auszügen
+# (collectors/osm-tiles.mjs): streamt einen Auszug durch osmium, eine Region pro Lauf. Läuft täglich (Dispatch der Uhr,
+# type `osm-tiles`), eine Region wird nur erneuert, wenn ihre Daten älter als 30 Tage sind - die Regionen verteilen sich
+# so über den Monat. Zustand (welche Region wann) steht in meta.json im Bucket orbis-osm und wird vorher heruntergeladen.
+# Ziel: Bucket orbis-osm. Der Lauf ersetzt die Region komplett (Kacheln ohne Kamera verschwinden).
+
+on:
+  repository_dispatch:
+    types: [osm-tiles]
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region erzwingen (europe, russia, asia, north-america, central-america, south-america, africa, oceania) - leer: älteste fällige'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osm-tiles
+  cancel-in-progress: false
+
+env:
+  # R2 versteht die neuen Prüfsummen-Header der AWS-CLI nicht
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_DEFAULT_REGION: auto
+  REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get install -y --no-install-recommends osmium-tool
+      - name: Previous state (meta.json from the bucket)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          mkdir -p out
+          if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ]; then
+            aws s3 cp s3://orbis-osm/meta.json out/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors \
+              || echo '::notice::no meta.json in orbis-osm yet - all regions count as due'
+          else
+            echo '::warning::R2 not configured - state unknown, the stalest region is chosen from scratch'
+          fi
+      - name: Refresh one region
+        run: node collectors/osm-tiles.mjs out "$REGION"
+      - name: Upload to R2 (orbis-osm)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          ls out
+          collectors/upload.sh out orbis-osm "public, max-age=86400" --collapse-manifest --replace-dirs

@@ -1,0 +1,103 @@
+name: Wetter (ICON)
+
+# Wetterkarten-Felder aus dem DWD-ICON-Lauf (collectors/wetter-icon.py, Format: docs/WETTERDATEN-FORMAT.md im Orbis-Repo),
+# veröffentlicht im R2-Bucket orbis-wetter (S3-API, öffentlich unter https://orbis-wetter.maltee.dev). Ein ICON-Lauf ist
+# ca. 3 h nach Laufzeit vollständig; der Job startet dann (Dispatch der Uhr, type `wetter`, 03:20/09:20/15:20/21:20 UTC)
+# und wartet bis zu 40 min auf den neuesten Lauf.
+#
+# Einrichtung: Bucket + Custom Domain, R2-Token mit Schreibrechten; Secrets R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+# R2_SECRET_ACCESS_KEY; optionale Repository-Variablen R2_BUCKET_WETTER (Standard orbis-wetter) und WETTER_PUBLIC_URL
+# (Standard https://orbis-wetter.maltee.dev). Ohne Zugangsdaten läuft die Verarbeitung, lädt aber nichts hoch.
+
+on:
+  repository_dispatch:
+    types: [wetter]
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'ICON-Lauf (YYYYMMDDHH) - leer: neuester'
+        type: string
+        default: ''
+      force:
+        description: 'Auch hochladen, wenn der Lauf schon veröffentlicht ist'
+        type: boolean
+        default: false
+      dem:
+        description: 'Geländehöhen (collectors/wetter-dem.py) neu bauen und hochladen - einmalig bzw. bei Änderung der Quelle'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wetter
+  cancel-in-progress: false
+
+env:
+  R2_BUCKET: ${{ vars.R2_BUCKET_WETTER || 'orbis-wetter' }}
+  WETTER_PUBLIC_URL: ${{ vars.WETTER_PUBLIC_URL || 'https://orbis-wetter.maltee.dev' }}
+  RUN_ID: ${{ github.event.inputs.run || github.event.client_payload.run || 'latest' }}
+  FORCE: ${{ github.event.inputs.force || github.event.client_payload.force || 'false' }}
+  DEM: ${{ github.event.inputs.dem || github.event.client_payload.dem || 'false' }}
+  # R2 versteht die neuen Prüfsummen-Header der AWS-CLI nicht
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_DEFAULT_REGION: auto
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: collectors/wetter-requirements.txt
+      - run: pip install -r collectors/wetter-requirements.txt
+      - name: Remap weights cache
+        uses: actions/cache@v4
+        with:
+          path: ../wetter-work/weights
+          key: wetter-weights-v1
+      - name: Published state
+        run: |
+          mkdir -p ../wetter-prev ../wetter-out/v1
+          if [ -n "$WETTER_PUBLIC_URL" ] && [ "$FORCE" != "true" ]; then
+            curl -fsS -m 30 "$WETTER_PUBLIC_URL/v1/latest.json" -o ../wetter-prev/latest.json || rm -f ../wetter-prev/latest.json
+          fi
+      - name: Build fields
+        run: |
+          python collectors/wetter-icon.py --out ../wetter-out --work ../wetter-work \
+            --run "$RUN_ID" --wait 40 --published ../wetter-prev/latest.json --selftest
+      - name: Build terrain heights
+        if: env.DEM == 'true'
+        run: python collectors/wetter-dem.py --out ../wetter-dem
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          [ -f ../wetter-out/v1/latest.json ] || [ -d ../wetter-dem/v1 ] || { echo 'Kein neuer Lauf - nichts hochzuladen'; exit 0; }
+          if [ -z "$R2_BUCKET" ] || [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::warning::R2 nicht konfiguriert - Upload übersprungen"; exit 0
+          fi
+          EP="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          if [ -d ../wetter-dem/v1/static ]; then
+            aws s3 sync ../wetter-dem/v1/static "s3://$R2_BUCKET/v1/static" --endpoint-url "$EP" \
+              --cache-control "public, max-age=86400" --content-type application/octet-stream --only-show-errors
+          fi
+          [ -f ../wetter-out/v1/latest.json ] || exit 0
+          RUN=$(python -c "import json;print(json.load(open('../wetter-out/v1/latest.json'))['run'])")
+          # Läufe sind unveränderlich (Pfad enthält den Lauf) -> lange cachen; latest.json zuletzt und kurz
+          aws s3 sync "../wetter-out/v1/$RUN" "s3://$R2_BUCKET/v1/$RUN" --endpoint-url "$EP" \
+            --cache-control "public, max-age=31536000, immutable" --content-type application/octet-stream --only-show-errors
+          aws s3 cp ../wetter-out/v1/latest.json "s3://$R2_BUCKET/v1/latest.json" --endpoint-url "$EP" \
+            --cache-control "public, max-age=120" --content-type application/json
+          # die zwei neuesten Läufe behalten (laufende Sitzungen lesen noch den vorigen)
+          aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix v1/ --delimiter / --endpoint-url "$EP" \
+            --query 'CommonPrefixes[].Prefix' --output text | tr '\t' '\n' | grep -E '^v1/[0-9]{10}/$' | sort | head -n -2 |
+            while read -r p; do aws s3 rm "s3://$R2_BUCKET/$p" --recursive --endpoint-url "$EP" --only-show-errors; done
