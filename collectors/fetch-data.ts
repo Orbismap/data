@@ -1066,6 +1066,28 @@ await task('ports', 'manual', async () => {
   console.log(`  ${fromWpi} ports from the World Port Index, ${doc.ports.length - fromWpi} more from UN/LOCODE`);
 });
 
+/**
+ * Election results (Wahlen layer, src/api/wahlen.ts): GERDA federal county series (CC BY 4.0) + GERDA state series (numbers from the
+ * Regionaldatenbank Deutschland, dl-de/by-2-0), aggregated to the 16 Bundeslaender, plus BKG VG2500 Laender outlines (dl-de/by-2-0).
+ * Historical elections never change, so this is a manual task. Logic in collectors/wahlen.mjs (identical to scripts/wahlen-build.mjs in orbis).
+ */
+await task('wahlen', 'manual', async () => {
+  // @ts-expect-error plain JS module
+  const { buildWahlen } = await import('./wahlen.mjs');
+  const GERDA = 'https://github.com/awiedem/german_election_data/raw/refs/heads/main/data';
+  const GEO = 'https://sgx.geodatenzentrum.de/wfs_vg2500?service=WFS&version=2.0.0&request=GetFeature&typeNames=vg2500:vg2500_lan&outputFormat=application/json&srsName=EPSG:4326';
+  const [federalText, ltwText, geoRaw] = await Promise.all([
+    get(`${GERDA}/federal_elections/county_level/final/federal_cty_unharm.csv`, 120000).then((r) => r.text()),
+    get(`${GERDA}/state_elections/final/ltw_wkr_unharm.csv`, 120000).then((r) => r.text()),
+    json<unknown>(GEO, 120000),
+  ]);
+  const { doc, geo } = buildWahlen({ federalText, ltwText, geoRaw }) as { doc: { btw: unknown[]; ltw: unknown[] }; geo: { features: unknown[] } };
+  if (geo.features.length !== 16 || doc.btw.length < 8 || doc.ltw.length < 80) throw new Error(`only ${geo.features.length} Laender / ${doc.btw.length} BTW / ${doc.ltw.length} LTW – keeping previous data`);
+  write('wahlen/de.json', doc);
+  write('wahlen/de-geo.json', geo);
+  console.log(`  ${geo.features.length} Laender, ${doc.btw.length} Bundestagswahlen, ${doc.ltw.length} Landtagswahlen`);
+});
+
 if (GROUP === 'daily') {
   meta.updated = new Date().toISOString();
   write('meta.json', meta);
