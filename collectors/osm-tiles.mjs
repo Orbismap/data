@@ -1,28 +1,31 @@
-// Surveillance cameras for the CCTV layer: a density heatmap for the overview and the single
-// cameras in 0.5° tiles for the zoomed-in view (no live Overpass queries needed).
-// Streams a Geofabrik regional extract through `osmium tags-filter -R` (stdin needs -R; nothing big is stored),
-// reads the man_made=surveillance nodes and writes
-//   <out>/cctv-<region>.json            heatmap: [[lon, lat, count], …] per ~1 km cell
-//   <out>/cctv-<region>/<ix>_<iy>.json  cameras of one 0.5° tile (see `record` for the layout)
-//   <out>/cctv-<region>-tiles.json      list of the tiles that exist
-// The same pass also collects further point data that used to be queried live from Overpass, in the
-// same tile layout (<out>/<set>-<region>/<ix>_<iy>.json plus <out>/<set>-<region>-tiles.json):
-//   blitzer   speed and red-light cameras (highway=speed_camera nodes, kind refined by type=enforcement relations)
-//   alpr      licence plate readers (surveillance:type=ALPR)
-//   webcam    OpenStreetMap webcams with a link
-//   wind      single wind turbines (power=generator, generator:source=wind)
-//   resource  mine shafts, adits, wells, quarry/mine/oil/gas/refinery points
+// OpenStreetMap point data for Orbis as PMTiles: one file per data set for the whole world in the bucket orbis-osm
+// (<set>.pmtiles, layer name = set). Sets: cctv (surveillance cameras without ALPR/webcams), blitzer (speed and
+// red-light cameras), alpr (licence plate readers), webcam (webcams with a link), wind (single wind turbines),
+// resource (mine shafts, adits, wells, quarry/mine/oil/gas/refinery points).
 // Only nodes are available when streaming (-R): ways and areas with these tags are not included.
-// Run by .github/workflows/osm-tiles.yml (target bucket orbis-osm; meta.json of the bucket is downloaded into <outDir> first):
-//   node collectors/osm-tiles.mjs <outDir> [region]
-// Without a region the stalest one (older than MAX_AGE_DAYS, or missing) is refreshed – one per
-// run, so a daily schedule staggers the regions and idles the rest of the month.
+//
+// Three steps (run by .github/workflows/osm-tiles.yml, bucket orbis-osm):
+//   node collectors/osm-tiles.mjs plan <dir> [region|all]      prints the JSON list of regions to refresh: <dir>/src/<region>/info.json
+//                                                              says when each was built; without argument the stalest one that is
+//                                                              older than MAX_AGE_DAYS (or missing), `all` = every region
+//   node collectors/osm-tiles.mjs extract <outDir> <region> [--url <pbf-url>]
+//                                                              streams the Geofabrik extract through `osmium tags-filter -R` (nothing
+//                                                              big is stored) and writes intermediates, one per set:
+//                                                              <outDir>/src/<region>/<set>.geojsonl (newline-delimited GeoJSON points)
+//                                                              <outDir>/src/<region>/info.json  (build date, counts, format)
+//                                                              --url builds from another .osm.pbf (local test with a tiny extract)
+//   node collectors/osm-tiles.mjs build <srcDir> <distDir>     builds <distDir>/<set>.pmtiles with tippecanoe from the intermediates
+//                                                              of ALL regions in <srcDir>/<region>/, the cctv heatmap
+//                                                              <distDir>/heat/cctv.json, meta.json and LICENSE.txt
+// The properties of the GeoJSON features are the fields of the former tile records (see FIELDS; fields that
+// have their default value are left out) – src/api/osmtiles.ts of the app turns them back into the records.
 // Data © OpenStreetMap contributors (ODbL), extracts by Geofabrik.
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { once } from 'node:events';
 
 export const REGIONS = {
   europe: 'europe',
@@ -36,11 +39,35 @@ export const REGIONS = {
 };
 const MAX_AGE_DAYS = 30;
 const CELL = 100; // heatmap cells per degree (0.01° ≈ 1 km)
-const TILE = 2; // camera tiles per degree (0.5°)
 /** bump when the file layout changes: older regions count as stale and are rebuilt */
-const FORMAT = 4;
-/** point data sets besides the CCTV cameras – the client reads them in src/api/osmtiles.ts */
-export const SETS = ['blitzer', 'alpr', 'webcam', 'wind', 'resource'];
+export const FORMAT = 5;
+/** point data sets – the client reads them in src/api/osmtiles.ts */
+export const SETS = ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'];
+/** pmtiles zoom range: single points down to z14 (no points dropped at max zoom unless a tile is huge), thinned out below */
+const MIN_ZOOM = 0;
+const MAX_ZOOM = 14;
+
+/** record fields after [lon, lat] per set (= property names of the GeoJSON features) */
+export const FIELDS = {
+  cctv: ['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id'],
+  blitzer: ['dir', 'kind', 'speed', 'operator', 'ref', 'id'],
+  alpr: ['dir', 'brand', 'flock', 'mount', 'operator', 'zone', 'since', 'ref', 'id'],
+  webcam: ['dir', 'name', 'operator', 'panning', 'link', 'id'],
+  wind: ['name', 'operator', 'manufacturer', 'model', 'output', 'id'],
+  resource: ['name', 'kind', 'words', 'resource', 'operator', 'id'],
+};
+/** default of a field (left out of the file): direction -1, flags 0, everything else '' (id is always present) */
+export const fieldDefault = (f) => (f === 'dir' ? -1 : f === 'guard' || f === 'flock' || f === 'panning' ? 0 : '');
+
+/** a record [lon, lat, …FIELDS[set]] as GeoJSON point feature */
+export function toFeature(set, rec) {
+  const props = {};
+  FIELDS[set].forEach((f, i) => {
+    const v = rec[i + 2];
+    if (f === 'id' || v !== fieldDefault(f)) props[f] = v;
+  });
+  return { type: 'Feature', geometry: { type: 'Point', coordinates: [rec[0], rec[1]] }, properties: props };
+}
 
 /** OPL escapes unsafe characters as %hex% */
 const unescapeOpl = (v) => v.replace(/%([0-9a-f]+)%/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)));
@@ -162,106 +189,185 @@ function classify(p) {
   return out;
 }
 
-async function heat(region) {
-  const url = `https://download.geofabrik.de/${REGIONS[region]}-latest.osm.pbf`;
-  const cmd = `curl -sSfL -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${url}" | osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - - n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry r/type=enforcement`;
-  const proc = spawn('bash', ['-c', `set -o pipefail; ${cmd}`], { stdio: ['ignore', 'pipe', 'inherit'] });
-  console.log(`${region}: streaming ${url}`);
+
+/** appends lines to a file with backpressure */
+function lineWriter(path) {
+  const ws = createWriteStream(path);
+  let buf = [];
+  let size = 0;
+  const flush = async () => {
+    if (!buf.length) return;
+    const chunk = buf.join('');
+    buf = [];
+    size = 0;
+    if (!ws.write(chunk)) await once(ws, 'drain');
+  };
+  return {
+    async write(line) {
+      buf.push(line, '\n');
+      size += line.length;
+      if (size > 1 << 20) await flush();
+    },
+    async close() {
+      await flush();
+      ws.end();
+      await once(ws, 'finish');
+    },
+  };
+}
+
+async function extract(region, outDir, url) {
+  const dir = join(outDir, 'src', region);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const src = url ?? `https://download.geofabrik.de/${REGIONS[region]}-latest.osm.pbf`;
+  const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry r/type=enforcement`;
+  const input = /^https?:/.test(src) ? `curl -sSfL -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`;
+  const proc = spawn('bash', ['-c', `set -o pipefail; ${input} | osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - - ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
+  console.log(`${region}: streaming ${src}`);
   const t0 = Date.now();
-  const cells = new Map();
-  const tiles = new Map();
+  const out = Object.fromEntries(SETS.filter((s) => s !== 'blitzer').map((s) => [s, lineWriter(join(dir, `${s}.geojsonl`))]));
+  const counts = Object.fromEntries(SETS.map((s) => [s, 0]));
   /** speed cameras by node id; enforcement relations (they come after all nodes) refine their kind */
   const speed = new Map();
-  /** the other point data sets: set → tile → records */
-  const sets = Object.fromEntries(['alpr', 'webcam', 'wind', 'resource'].map((k) => [k, new Map()]));
-  let n = 0;
   for await (const line of createInterface({ input: proc.stdout })) {
     const rel = line.charCodeAt(0) === 114 ? parseEnforcement(line) : null;
     if (rel) {
       // positions of relations are not available when streaming (-R), so use their device nodes:
       // red-light relation → its devices are red-light cameras; several devices of a speed relation → monitored stretch
       const devices = rel.members.map((m) => speed.get(m.ref)).filter(Boolean);
-      if (rel.tags.enforcement === 'traffic_signals') for (const d of devices) d.rec[3] = 'signals';
-      else if (rel.tags.enforcement === 'maxspeed' && devices.length > 1) for (const d of devices) if (d.rec[3] === 'cam') d.rec[3] = 'section';
+      if (rel.tags.enforcement === 'traffic_signals') for (const d of devices) d[3] = 'signals';
+      else if (rel.tags.enforcement === 'maxspeed' && devices.length > 1) for (const d of devices) if (d[3] === 'cam') d[3] = 'section';
       continue;
     }
     const node = parseNode(line);
     if (!node) continue;
     if (node.tags.highway === 'speed_camera') {
-      speed.set(node.id, { x: node.x, y: node.y, rec: speedRecord(node) });
+      speed.set(node.id, speedRecord(node));
       continue;
     }
-    for (const [set, rec] of classify(node)) {
-      const tile = `${Math.floor(node.x * TILE)}_${Math.floor(node.y * TILE)}`;
-      if (!sets[set].has(tile)) sets[set].set(tile, []);
-      sets[set].get(tile).push(rec);
+    const hits = classify(node);
+    const cam = parseOpl(line);
+    if (cam) hits.push(['cctv', record(cam)]);
+    for (const [set, rec] of hits) {
+      await out[set].write(JSON.stringify(toFeature(set, rec)));
+      if (++counts[set] % 100000 === 0) console.log(`${region}: ${counts[set]} ${set} so far (${Math.round((Date.now() - t0) / 1000)} s)`);
     }
-    const p = parseOpl(line);
-    if (!p) continue;
-    const key = `${Math.round(p.x * CELL)},${Math.round(p.y * CELL)}`;
-    cells.set(key, (cells.get(key) ?? 0) + 1);
-    const tile = `${Math.floor(p.x * TILE)}_${Math.floor(p.y * TILE)}`;
-    if (!tiles.has(tile)) tiles.set(tile, []);
-    tiles.get(tile).push(record(p));
-    if (++n % 50000 === 0) console.log(`${region}: ${n} cameras so far (${Math.round((Date.now() - t0) / 1000)} s)`);
   }
   const code = await new Promise((res) => proc.on('close', res));
   if (code !== 0) throw new Error(`${region}: download/filter failed (exit ${code})`);
-  const out = [...cells].map(([k, c]) => {
-    const [x, y] = k.split(',').map(Number);
-    return [x / CELL, y / CELL, c];
+  const bl = lineWriter(join(dir, 'blitzer.geojsonl'));
+  for (const rec of speed.values()) await bl.write(JSON.stringify(toFeature('blitzer', rec)));
+  counts.blitzer = speed.size;
+  await bl.close();
+  for (const w of Object.values(out)) await w.close();
+  console.log(`${region}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')} (${Math.round((Date.now() - t0) / 1000)} s)`);
+  return counts;
+}
+
+/** which regions to refresh: `all`, the given one, or the stalest one that is due */
+export function planRegions(infos, arg, now = Date.now()) {
+  if (arg === 'all') return Object.keys(REGIONS);
+  if (arg) {
+    if (!REGIONS[arg]) throw new Error(`unknown region ${arg}`);
+    return [arg];
+  }
+  const age = (r) => (infos[r]?.format === FORMAT ? now - infos[r].at : Infinity);
+  const due = Object.keys(REGIONS).filter((r) => age(r) > MAX_AGE_DAYS * 864e5).sort((a, b) => age(b) - age(a));
+  return due.slice(0, 1);
+}
+
+const readInfo = (srcDir, region) => {
+  try {
+    return JSON.parse(readFileSync(join(srcDir, region, 'info.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+/** streams the cctv intermediates of all regions into world heatmap cells [lon, lat, count] */
+async function heatCells(files) {
+  const cells = new Map();
+  for (const f of files) {
+    for await (const line of createInterface({ input: createReadStream(f) })) {
+      if (!line) continue;
+      const [x, y] = JSON.parse(line).geometry.coordinates;
+      const key = Math.round(x * CELL) * 1e6 + Math.round(y * CELL);
+      cells.set(key, (cells.get(key) ?? 0) + 1);
+    }
+  }
+  return [...cells].map(([k, c]) => {
+    // key = X·1e6 + Y with |Y| ≤ 9000 < 5e5
+    const x = Math.round(k / 1e6);
+    return [x / CELL, (k - x * 1e6) / CELL, c];
   });
-  console.log(`${region}: ${n} cameras in ${out.length} cells and ${tiles.size} tiles (${Math.round((Date.now() - t0) / 1000)} s)`);
-  const speedTiles = new Map();
-  for (const { x, y, rec } of speed.values()) {
-    const tile = `${Math.floor(x * TILE)}_${Math.floor(y * TILE)}`;
-    if (!speedTiles.has(tile)) speedTiles.set(tile, []);
-    speedTiles.get(tile).push(rec);
+}
+
+function run(cmd, args) {
+  return new Promise((res, rej) => {
+    const p = spawn(cmd, args, { stdio: 'inherit' });
+    p.on('error', rej);
+    p.on('close', (c) => (c === 0 ? res() : rej(new Error(`${cmd} exited with ${c}`))));
+  });
+}
+
+async function build(srcDir, distDir) {
+  const regions = Object.keys(REGIONS).filter((r) => existsSync(join(srcDir, r, 'info.json')) || existsSync(join(srcDir, r, 'cctv.geojsonl')));
+  const extra = readdirSync(srcDir, { withFileTypes: true }).filter((d) => d.isDirectory() && !REGIONS[d.name]).map((d) => d.name); // test regions
+  const used = [...regions, ...extra];
+  if (!used.length) throw new Error(`no intermediates in ${srcDir}`);
+  mkdirSync(join(distDir, 'heat'), { recursive: true });
+  const meta = { format: FORMAT, at: Date.now(), regions: {}, sets: {} };
+  for (const r of used) {
+    const info = readInfo(srcDir, r);
+    if (info) meta.regions[r] = info;
   }
-  console.log(`${region}: ${speed.size} speed/red-light cameras in ${speedTiles.size} tiles`);
-  const counts = { blitzer: speed.size };
-  for (const [k, m] of Object.entries(sets)) {
-    counts[k] = [...m.values()].reduce((a, l) => a + l.length, 0);
-    console.log(`${region}: ${counts[k]} ${k} points in ${m.size} tiles`);
+  console.log(`building from ${used.join(', ')}`);
+  for (const set of SETS) {
+    const files = used.map((r) => join(srcDir, r, `${set}.geojsonl`)).filter((f) => existsSync(f) && statSync(f).size > 0);
+    const target = join(distDir, `${set}.pmtiles`);
+    if (!files.length) {
+      console.log(`${set}: no data – skipped`);
+      continue;
+    }
+    // -r1: no thinning by rate; -b 0: no buffer (points would be duplicated into the neighbour tiles); --drop-densest-as-needed only where a tile gets too big (dense low zooms), -M/-O keep z14 complete
+    await run('tippecanoe', [
+      '-o', target, '--force', '-l', set, '-n', set, '-N', `OpenStreetMap ${set} points`,
+      '-Z', String(MIN_ZOOM), '-z', String(MAX_ZOOM), '-r1', '-b', '0', '--drop-densest-as-needed', '-M', '1000000', '-O', '250000',
+      '--read-parallel', '-q', '-A', '© OpenStreetMap contributors (ODbL)', ...files,
+    ]);
+    meta.sets[set] = { bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0) };
+    console.log(`${set}: ${meta.sets[set].bytes} bytes`);
   }
-  return { out, n, tiles, sets: { blitzer: speedTiles, ...sets }, counts };
+  const cctv = used.map((r) => join(srcDir, r, 'cctv.geojsonl')).filter((f) => existsSync(f));
+  const cells = await heatCells(cctv);
+  writeFileSync(join(distDir, 'heat', 'cctv.json'), JSON.stringify(cells));
+  meta.heatCells = cells.length;
+  console.log(`heat/cctv.json: ${cells.length} cells`);
+  writeFileSync(join(distDir, 'meta.json'), JSON.stringify(meta));
+  writeFileSync(join(distDir, 'LICENSE.txt'), 'Data © OpenStreetMap contributors, available under the Open Database License (ODbL) 1.0: https://opendatacommons.org/licenses/odbl/1-0/\nhttps://www.openstreetmap.org/copyright\nDerived from Geofabrik extracts (https://download.geofabrik.de).\n');
 }
 
 async function main() {
-  const [outDir, only] = process.argv.slice(2);
-  if (!outDir) throw new Error('usage: osm-tiles <outDir> [region]');
-  mkdirSync(outDir, { recursive: true });
-  const metaPath = join(outDir, 'meta.json');
-  const meta = existsSync(metaPath) ? JSON.parse(readFileSync(metaPath, 'utf8')) : { regions: {} };
-  meta.regions ??= {};
-  let region = only;
-  if (!region) {
-    const age = (r) => (meta.regions[r]?.format === FORMAT ? Date.now() - meta.regions[r].at : Infinity);
-    region = Object.keys(REGIONS).filter((r) => age(r) > MAX_AGE_DAYS * 864e5).sort((a, b) => age(b) - age(a))[0];
-    if (!region) return console.log('all regions are up to date');
+  const [cmd, ...args] = process.argv.slice(2);
+  if (cmd === 'plan') {
+    const [dir, arg] = args;
+    const infos = Object.fromEntries(Object.keys(REGIONS).map((r) => [r, readInfo(join(dir ?? '.', 'src'), r)]));
+    console.log(JSON.stringify(planRegions(infos, arg)));
+  } else if (cmd === 'extract') {
+    const [outDir, region, flag, url] = args;
+    if (!outDir || !region) throw new Error('usage: osm-tiles extract <outDir> <region> [--url <pbf>]');
+    if (!REGIONS[region] && flag !== '--url') throw new Error(`unknown region ${region}`);
+    const counts = await extract(region, outDir, flag === '--url' ? url : undefined);
+    if (!url && counts.cctv < 50) throw new Error(`${region}: only ${counts.cctv} cameras – keeping previous data`);
+    writeFileSync(join(outDir, 'src', region, 'info.json'), JSON.stringify({ at: Date.now(), counts, format: FORMAT }));
+  } else if (cmd === 'build') {
+    const [srcDir, distDir] = args;
+    if (!srcDir || !distDir) throw new Error('usage: osm-tiles build <srcDir> <distDir>');
+    await build(srcDir, distDir);
+  } else {
+    throw new Error('usage: osm-tiles plan <dir> [region|all] | extract <outDir> <region> | build <srcDir> <distDir>');
   }
-  console.log(`refreshing ${region}`);
-  if (!REGIONS[region]) throw new Error(`unknown region ${region}`);
-  const { out, n, tiles, sets, counts } = await heat(region);
-  if (n < 50) throw new Error(`${region}: only ${n} cameras – keeping previous data`);
-  writeFileSync(join(outDir, `cctv-${region}.json`), JSON.stringify(out));
-  // replace the region's tiles as a whole, so tiles without cameras any more disappear
-  const dir = join(outDir, `cctv-${region}`);
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { recursive: true });
-  for (const [tile, cams] of tiles) writeFileSync(join(dir, `${tile}.json`), JSON.stringify(cams));
-  writeFileSync(join(outDir, `cctv-${region}-tiles.json`), JSON.stringify([...tiles.keys()]));
-  console.log(`${region}: wrote ${tiles.size} tile files`);
-  for (const set of SETS) {
-    const sdir = join(outDir, `${set}-${region}`);
-    rmSync(sdir, { recursive: true, force: true });
-    mkdirSync(sdir, { recursive: true });
-    for (const [tile, recs] of sets[set]) writeFileSync(join(sdir, `${tile}.json`), JSON.stringify(recs));
-    writeFileSync(join(outDir, `${set}-${region}-tiles.json`), JSON.stringify([...sets[set].keys()]));
-  }
-  meta.regions[region] = { at: Date.now(), cameras: n, cells: out.length, tiles: tiles.size, points: counts, format: FORMAT };
-  writeFileSync(metaPath, JSON.stringify(meta));
-  writeFileSync(join(outDir, 'LICENSE.txt'), 'Data © OpenStreetMap contributors, available under the Open Database License (ODbL) 1.0: https://opendatacommons.org/licenses/odbl/1-0/\nhttps://www.openstreetmap.org/copyright\nDerived from Geofabrik extracts (https://download.geofabrik.de).\n');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main().catch((e) => { console.error(e.message); process.exit(1); });

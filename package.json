@@ -8,10 +8,12 @@
     "deploy:camdir": "wrangler deploy -c workers/camdir/wrangler.jsonc",
     "deploy:clock": "wrangler deploy -c workers/clock/wrangler.jsonc",
     "collect": "node collectors/build.mjs && node dist/fetch-data.mjs",
-    "build:collectors": "node collectors/build.mjs"
+    "build:collectors": "node collectors/build.mjs",
+    "test": "vitest run"
   },
   "devDependencies": {
     "esbuild": "0.28.2",
+    "vitest": "2.1.9",
     "wrangler": "4.157.0"
   },
   "pnpm": {

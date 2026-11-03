@@ -4,9 +4,10 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
-  "keep_vars": true,
+  "keep_vars": true, // schützt nur im Dashboard gesetzte Variablen, die NICHT in dieser Datei stehen
+  "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" },
   "kv_namespaces": [
     { "binding": "CAMDIR", "id": "e053eae9163d47da8c8b3f6a28c1115d" } // KV "orbis_cams"
   ]
-  // Im Dashboard setzen (nicht hier): Secret ADMIN_TOKEN, Text ALLOWED_ORIGINS (optional)
+  // Im Dashboard setzen (nicht hier): Secret ADMIN_TOKEN
 }

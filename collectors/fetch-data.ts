@@ -104,7 +104,7 @@ await task('firms', 'live-15m', async () => {
     console.log('  no FIRMS_MAP_KEY secret – skipping');
     return;
   }
-  const { loadFirms } = await import('@orbis/api/events');
+  const { loadFirms, packFirms } = await import('@orbis/api/events');
   const byId = new Map<string, unknown>();
   for (const sensor of ['VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'VIIRS_SNPP_NRT', 'MODIS_NRT']) {
     try {
@@ -112,7 +112,7 @@ await task('firms', 'live-15m', async () => {
       const fc = await loadFirms(key, sensor, 1, '-180,-90,180,90');
       for (const f of fc.features) {
         const [lon, lat] = f.geometry.coordinates;
-        f.geometry.coordinates = [Math.round(lon * 1e4) / 1e4, Math.round(lat * 1e4) / 1e4];
+        f.geometry.coordinates = [Math.round(lon * 1e3) / 1e3, Math.round(lat * 1e3) / 1e3];
         byId.set(`${f.geometry.coordinates[0]},${f.geometry.coordinates[1]},${f.properties.time}`, f);
       }
       console.log(`  ${sensor}: ${fc.features.length}`);
@@ -131,7 +131,9 @@ await task('firms', 'live-15m', async () => {
     }
     throw new Error('no FIRMS data');
   }
-  write('firms/world.json', { type: 'FeatureCollection', features: [...byId.values()] });
+  // compact v2 format (rows instead of GeoJSON features, ~4x smaller); the app reads v2 and the old FeatureCollection.
+  // The orbis checkout must contain packFirms (src/api/events.ts) – merge the app change first.
+  write('firms/world.json', packFirms([...byId.values()] as Parameters<typeof packFirms>[0]));
 });
 
 // ---------------------------------------------------------------------------

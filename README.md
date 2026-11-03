@@ -28,7 +28,7 @@ Hosts einstufig unter `*.maltee.dev` (das kostenlose Zertifikat deckt nur eine E
 |---|---|---|---|---|
 | `orbis-live` | `orbis-live.maltee.dev` | Minuten-/Stundensnapshots, überschrieben | `max-age=60` bis `600` je Pfad, `stale-while-revalidate` | überschreibt sich selbst |
 | `orbis-data` | `orbis-data.maltee.dev` | täglich/wöchentlich: Zeugen-Karte, Vulkane, Radio, Kabel, Cams, PeeringDB, Wahlen, Häfen ... | `max-age=3600`, `stale-while-revalidate=86400` | Lifecycle: `archive/` nach 30 Tagen |
-| `orbis-osm` | `orbis-osm.maltee.dev` | Geofabrik-Kacheln (heute Branch `data-osm`) | `max-age=86400` | Workflow ersetzt Region komplett |
+| `orbis-osm` | `orbis-osm.maltee.dev` | OSM-Punktdaten als PMTiles (`<set>.pmtiles` ×6, `heat/cctv.json`, `meta.json`, Zwischendateien `src/`), siehe Abschnitt „OSM-Punktdaten (PMTiles)“ | PMTiles/Heat `max-age=86400`, `meta.json` `max-age=3600` | Build ersetzt die Dateien; alte JSON-Kacheln werden gelöscht |
 | `orbis-wetter` | `orbis-wetter.maltee.dev` | ICON-Wetterfelder (`v1/<run>/<var>/*.owx`, `v1/latest.json`) | Runs immutable, `latest.json` 120 s | Workflow behält 2 Runs (+ Lifecycle 7 Tage) |
 | `orbis-assets` | `orbis-assets.maltee.dev` | `models/`, `textures/`, große Teile von `public/data` | `immutable` unter Hash-Pfaden, `index.json` kurz | Lifecycle: nicht mehr referenzierte Hash-Pfade nach 90 Tagen |
 
@@ -90,7 +90,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | `live-15m.yml` (`live-15m`) | :07, :22, :37, :52 | `fetch-data.ts --group live-15m` | `orbis-live` | 35 min |
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
-| `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (eine Region ≥ 30 Tage alt) | `orbis-osm` | 180 min |
+| `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `build`; eine Region ≥ 30 Tage alt, oder alle mit `all_regions`) | `orbis-osm` | je Job 350 min |
 | `wetter.yml` (`wetter`) | 03:20, 09:20, 15:20, 21:20 | `wetter-icon.py` (+ `wetter-dem.py` auf Wunsch) | `orbis-wetter` (`vars.R2_BUCKET_WETTER`) | 60 min |
 
 Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine Dateien; scheitert er, bleiben die alten Objekte stehen, denn der Upload löscht nie):
@@ -101,7 +101,7 @@ Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine
 | `daily` | `ukraine-harm` → `ukraine-harm.json`; `ipc-gaza` → `ipc-gaza.json`; `gaza-hdx` → `gaza-displacement.json`, `healthsites-pse.json`; `ukraine-oblast` → `ukraine-oblast.json`; `osm-cables` → `osm-cables/`; `volcanoes` → `volcanoes.json`; `radio` → `radio/top.json`, `radio/cells/*.json`; `mars` → `mars/traverse.json`; `cams` → `cams/<feed>.json`; `cams-world` → `cams/world.json`; dazu `meta.json` (Zeitstempel, `camFeeds`) |
 | `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
 
-Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `tsunami/PHEB.xml` alle 5 min nach `orbis-live`. Die Dateipfade sind dieselben wie bisher im `data`-Branch (`src/api/data.ts` der App liest sie unverändert); `orbis-osm` hat dasselbe Layout wie `data-osm`.
+Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `tsunami/PHEB.xml` alle 5 min nach `orbis-live`. Die Dateipfade sind dieselben wie bisher im `data`-Branch (`src/api/data.ts` der App liest sie unverändert); `orbis-osm` enthält PMTiles (siehe Abschnitt „OSM-Punktdaten (PMTiles)“).
 
 **Hilfsskripte:**
 
@@ -109,7 +109,7 @@ Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `
 - `collectors/upload.sh <dir> <bucket> <cache-control>` lädt per `aws s3 sync` (ohne `--delete`) hoch und merged die `manifest.json` des Buckets (herunterladen, `collectors/manifest.mjs`, hochladen). Ohne R2-Zugangsdaten wird nur gewarnt. `--replace-dirs` (osm-tiles) ersetzt Verzeichnisse komplett, `--collapse-manifest` fasst Kachelordner zu einem Eintrag zusammen.
 - `collectors/manifest.mjs`: Eintrag je Schlüssel `{updated, bytes, source, license}`; Quellen und Lizenzen stehen in der Tabelle `RULES` (aus `docs/DATENQUELLEN.md` der App). Für `orbis-live` bleiben die Einträge der Uhr erhalten; umgekehrt übernimmt die Uhr beim Neuaufbau `source`/`license` fremder Schlüssel aus der alten Manifest-Datei.
 
-Cache-Control beim Upload: `orbis-live` `public, max-age=300, stale-while-revalidate=1800`; `orbis-data` `public, max-age=3600, stale-while-revalidate=86400`; `orbis-osm` `public, max-age=86400`; `orbis-wetter` wie bisher je Schlüssel (Läufe `public, max-age=31536000, immutable`, `latest.json` `public, max-age=120`, `v1/static` `public, max-age=86400`).
+Cache-Control beim Upload: `orbis-live` `public, max-age=300, stale-while-revalidate=1800`; `orbis-data` `public, max-age=3600, stale-while-revalidate=86400`; `orbis-osm` PMTiles/Heat/Lizenz `public, max-age=86400`, `meta.json` `public, max-age=3600`, `src/` `no-store`; `orbis-wetter` wie bisher je Schlüssel (Läufe `public, max-age=31536000, immutable`, `latest.json` `public, max-age=120`, `v1/static` `public, max-age=86400`).
 
 **Lokal ausführen** (ohne Upload, ohne Secrets; Quellen mit Schlüssel werden übersprungen):
 
@@ -121,7 +121,41 @@ ORBIS_SRC=../orbis pnpm collect --group daily --out ./out --only volcanoes,mars 
 node collectors/manifest.mjs ./out - ./out-manifest.json                           # Manifest-Test
 ```
 
-Ohne `ORBIS_SRC` erwartet `build.mjs` den Checkout unter `./orbis` (so wie in CI). `node collectors/osm-tiles.mjs ./out <region>` braucht `osmium` und lädt einen Geofabrik-Auszug (sehr groß); `wetter-icon.py` braucht `pip install -r collectors/wetter-requirements.txt`.
+Ohne `ORBIS_SRC` erwartet `build.mjs` den Checkout unter `./orbis` (so wie in CI). `osm-tiles.mjs` braucht `osmium` und `tippecanoe` und lädt einen Geofabrik-Auszug (siehe „OSM-Punktdaten (PMTiles)“, lokal mit einem kleinen Auszug testen); `wetter-icon.py` braucht `pip install -r collectors/wetter-requirements.txt`.
+
+### OSM-Punktdaten (PMTiles)
+
+`collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen sechs Datensätze, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Datensatz, Zoom 0–14, nur Knoten, ODbL):
+
+| Datei | Inhalt |
+|---|---|
+| `cctv.pmtiles` | Überwachungskameras (`man_made=surveillance` ohne ALPR/Webcams) |
+| `blitzer.pmtiles` | Blitzer und Rotlichtkameras (`highway=speed_camera`, Art über `type=enforcement`-Relationen) |
+| `alpr.pmtiles` | Kennzeichenleser (`surveillance:type=ALPR`) |
+| `webcam.pmtiles` | Webcams mit Link |
+| `wind.pmtiles` | einzelne Windräder |
+| `resource.pmtiles` | Schächte, Stollen, Bohrlöcher, Steinbrüche, Bergwerke, Öl/Gas/Raffinerien |
+| `heat/cctv.json` | Dichte-Zellen `[lon, lat, anzahl]` (0,01°) der ganzen Welt für die CCTV-Heatmap |
+| `meta.json` | `format: 5`, je Region Bauzeit und Zähler (`regions`), je Datensatz Größe/Anzahl (`sets`) |
+| `LICENSE.txt` | ODbL-Hinweis |
+| `src/<region>/<set>.geojsonl`, `src/<region>/info.json` | Zwischendateien (Newline-delimited GeoJSON, je Region), Eingabe des Builds; `info.json` = Bauzeit der Region |
+
+Die Eigenschaften der Features sind die Felder der früheren Kachel-Datensätze (`FIELDS` im Sammler, `src/api/osmtiles.ts` der App baut daraus wieder die Arrays); Felder mit Standardwert (`dir` -1, Flags 0, leere Texte) fehlen. tippecanoe-Optionen: `-Z0 -z14 -r1 -b0 --drop-densest-as-needed -M 1000000 -O 250000` (Punkte werden nur ausgedünnt, wo eine Kachel zu groß wird; in den hohen Zoomstufen bleiben alle). Die App liest mit HTTP-Range-Anfragen (`pmtiles`-Bibliothek) und nimmt diese Quelle, wenn `VITE_OSM_BASE` gesetzt ist (z. B. `https://orbis-osm.maltee.dev/`).
+
+**Ablauf** (`osm-tiles.yml`): `plan` liest `src/*/info.json` und wählt die älteste Region, die älter als 30 Tage ist (Format-Wechsel zählt als veraltet) – oder alle 8 bei `all_regions`; `extract` läuft je Region als eigener Matrix-Job (osmium streamt den Auszug, Ausgabe nach `src/<region>/`, `info.json` zuletzt); `build` lädt `src/` aller Regionen, baut die sechs PMTiles mit tippecanoe (2.79.0, aus dem Quelltext gebaut und gecacht) und `heat/cctv.json`, lädt alles hoch und löscht die alten JSON-Kacheln (`cctv-*`, `blitzer-*` …). Eine Region wird ersetzt, indem ihre Zwischendateien ersetzt werden, die PMTiles entstehen immer aus allen Regionen.
+
+**Erster Lauf / leerer Bucket:** *Actions → OSM tiles → Run workflow* mit `all_regions` = true (alle 8 Regionen parallel, Europa ~3 h; die Jobs tauschen Daten über den Bucket aus, R2-Secrets sind Pflicht). Danach genügt der tägliche Dispatch der Uhr.
+
+**Lokal testen** (kleiner Auszug, `brew install osmium-tool tippecanoe pmtiles`):
+
+```bash
+node collectors/osm-tiles.mjs extract ./osm-test bremen --url https://download.geofabrik.de/europe/germany/bremen-latest.osm.pbf
+node collectors/osm-tiles.mjs build ./osm-test/src ./osm-test/dist     # ./osm-test/dist/*.pmtiles, heat/cctv.json, meta.json
+pmtiles show ./osm-test/dist/cctv.pmtiles
+node collectors/osm-tiles.mjs plan ./osm-test [region|all]             # welche Regionen wären fällig
+```
+
+Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mit einem Server ausliefern, der Range-Anfragen und CORS (`Access-Control-Allow-Origin`, `Range` erlaubt, `ETag` freigegeben) beherrscht.
 
 ### Benötigte Secrets und Variablen (Repository `Orbismap/data`, *Settings → Secrets and variables → Actions*)
 

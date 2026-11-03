@@ -451,10 +451,14 @@ export async function runDue(env, now = Date.now()) {
 
 // ---- HTTP ---------------------------------------------------------------------------------------
 
+// Workers-Preview-URLs der App (<alias>-orbis-site.malte9799.workers.dev) sind zusätzlich zur Liste erlaubt.
+const PREVIEW_ORIGIN = /^https:\/\/[a-z0-9-]+-orbis-site\.malte9799\.workers\.dev$/;
+const originAllowed = (allowed, origin) => allowed.includes(origin) || PREVIEW_ORIGIN.test(origin);
+
 function corsFor(req, env) {
   const origin = req.headers.get('Origin') || '';
   const allowed = (env.ALLOWED_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
-  if (allowed.length && !allowed.includes(origin)) return null;
+  if (allowed.length && !originAllowed(allowed, origin)) return null;
   return { 'Access-Control-Allow-Origin': origin || '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '86400', Vary: 'Origin' };
 }
 

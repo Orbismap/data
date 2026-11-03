@@ -21,6 +21,10 @@ const KEY = 'dirs';
 const MAX_ENTRIES = 20000;
 const KEY_RE = /^[\w.:@,|/ -]{1,120}$/;
 
+// Workers-Preview-URLs der App (<alias>-orbis-site.malte9799.workers.dev) sind zusätzlich zur Liste erlaubt.
+const PREVIEW_ORIGIN = /^https:\/\/[a-z0-9-]+-orbis-site\.malte9799\.workers\.dev$/;
+const originAllowed = (allowed, origin) => allowed.includes(origin) || PREVIEW_ORIGIN.test(origin);
+
 const cors = (origin) => ({
   'Access-Control-Allow-Origin': origin || '*',
   'Access-Control-Allow-Methods': 'GET, PUT, DELETE, OPTIONS',
@@ -51,7 +55,7 @@ export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') ?? '';
     const allowed = (env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    if (allowed.length && origin && !allowed.includes(origin)) return new Response('Origin not allowed', { status: 403, headers: cors(origin) });
+    if (allowed.length && origin && !originAllowed(allowed, origin)) return new Response('Origin not allowed', { status: 403, headers: cors(origin) });
     const headers = cors(allowed.length ? origin : '*');
     if (request.method === 'OPTIONS') return new Response(null, { headers });
 

@@ -36,7 +36,7 @@ export const RULES = [
   [/^street\//, 'https://tiles.mapillary.com (Mapillary vector tiles)', 'Mapillary, CC BY-SA 4.0'],
   [/^meta\.json$/, 'Orbismap/data collectors', 'n/a'],
   // orbis-osm
-  [/^(cctv|blitzer|alpr|webcam|wind|resource)-/, 'OpenStreetMap, Geofabrik extracts (https://download.geofabrik.de)', ODBL],
+  [/^((cctv|blitzer|alpr|webcam|wind|resource)\.pmtiles|heat\/)/, 'OpenStreetMap, Geofabrik extracts (https://download.geofabrik.de)', ODBL],
   [/^LICENSE\.txt$/, 'Orbismap/data collectors', ODBL],
 ];
 

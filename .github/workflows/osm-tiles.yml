@@ -1,10 +1,16 @@
 name: OSM tiles
 
-# Kamera-Dichte (CCTV) und weitere OSM-Punktkacheln (Blitzer, ALPR, Webcams, Windräder, Ressourcen) aus Geofabrik-Auszügen
-# (collectors/osm-tiles.mjs): streamt einen Auszug durch osmium, eine Region pro Lauf. Läuft täglich (Dispatch der Uhr,
-# type `osm-tiles`), eine Region wird nur erneuert, wenn ihre Daten älter als 30 Tage sind - die Regionen verteilen sich
-# so über den Monat. Zustand (welche Region wann) steht in meta.json im Bucket orbis-osm und wird vorher heruntergeladen.
-# Ziel: Bucket orbis-osm. Der Lauf ersetzt die Region komplett (Kacheln ohne Kamera verschwinden).
+# OSM-Punktdaten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen) als PMTiles, eine Datei je Datensatz weltweit
+# (collectors/osm-tiles.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`) in drei Schritten:
+#   plan     liest src/<region>/info.json aus dem Bucket orbis-osm und wählt die Region, die älter als 30 Tage ist (die
+#            älteste; die Regionen verteilen sich so über den Monat) - oder alle 8 bei `all_regions`
+#   extract  eine Matrix-Job je Region: streamt den Geofabrik-Auszug durch osmium und lädt die Zwischendateien
+#            src/<region>/<set>.geojsonl (+ info.json) nach orbis-osm
+#   build    lädt src/ aller Regionen, baut mit tippecanoe <set>.pmtiles (+ heat/cctv.json, meta.json) und lädt sie hoch;
+#            löscht danach die alten JSON-Kacheln im Bucket
+# Ziel: Bucket orbis-osm (R2-Zugangsdaten sind Pflicht: die Jobs tauschen die Daten über den Bucket aus).
+# Erster Lauf (leerer Bucket): `all_regions` aktivieren, dann werden alle Regionen in einem Lauf gebaut (Europa dauert ~3 h,
+# die Regionen laufen parallel in der Matrix, jede in ihrem eigenen Job mit 6-h-Limit).
 
 on:
   repository_dispatch:
@@ -15,6 +21,10 @@ on:
         description: 'Region erzwingen (europe, russia, asia, north-america, central-america, south-america, africa, oceania) - leer: älteste fällige'
         type: string
         default: ''
+      all_regions:
+        description: 'Alle Regionen in einem Lauf bauen (z. B. beim ersten Lauf mit leerem Bucket)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,38 +38,118 @@ env:
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
   AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
   AWS_DEFAULT_REGION: auto
-  REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
+  TIPPECANOE_VERSION: '2.79.0'
 
 jobs:
-  update:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 15
+    outputs:
+      regions: ${{ steps.plan.outputs.regions }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
+      ALL_REGIONS: ${{ github.event.inputs.all_regions || github.event.client_payload.all_regions || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Plan
+        id: plan
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo '::error::R2 credentials missing - osm-tiles exchanges its data through the bucket orbis-osm'
+            exit 1
+          fi
+          mkdir -p state
+          aws s3 sync s3://orbis-osm/src state/src --exclude "*" --include "*/info.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no state in orbis-osm yet - all regions count as due'
+          ARG="$REGION"
+          if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
+          REGIONS=$(node collectors/osm-tiles.mjs plan state $ARG)
+          echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          echo "regions to refresh: $REGIONS"
+
+  extract:
+    needs: plan
+    if: ${{ needs.plan.outputs.regions != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.regions) }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: sudo apt-get install -y --no-install-recommends osmium-tool
-      - name: Previous state (meta.json from the bucket)
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      - name: Extract ${{ matrix.region }}
+        run: node collectors/osm-tiles.mjs extract out "${{ matrix.region }}"
+      - name: Upload intermediates to R2 (orbis-osm/src)
         run: |
-          mkdir -p out
-          if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ]; then
-            aws s3 cp s3://orbis-osm/meta.json out/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors \
-              || echo '::notice::no meta.json in orbis-osm yet - all regions count as due'
-          else
-            echo '::warning::R2 not configured - state unknown, the stalest region is chosen from scratch'
-          fi
-      - name: Refresh one region
-        run: node collectors/osm-tiles.mjs out "$REGION"
+          ls -la "out/src/${{ matrix.region }}"
+          # info.json last: it is what `plan` looks at, so a failed upload does not count as refreshed
+          aws s3 sync "out/src/${{ matrix.region }}" "s3://orbis-osm/src/${{ matrix.region }}/" --delete --exclude info.json \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
+          aws s3 cp "out/src/${{ matrix.region }}/info.json" "s3://orbis-osm/src/${{ matrix.region }}/info.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
+
+  build:
+    needs: [plan, extract]
+    # also when single regions failed: the others are still in src/ and the tiles are built from what exists
+    if: ${{ !cancelled() && needs.plan.outputs.regions != '[]' && needs.extract.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: tippecanoe (cache)
+        id: tippecanoe
+        uses: actions/cache@v4
+        with:
+          path: ~/tippecanoe
+          key: tippecanoe-${{ env.TIPPECANOE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: tippecanoe (build felt/tippecanoe ${{ env.TIPPECANOE_VERSION }})
+        if: steps.tippecanoe.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev zlib1g-dev
+          git clone --depth 1 --branch "$TIPPECANOE_VERSION" https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src
+          make -C /tmp/tippecanoe-src -j"$(nproc)"
+          make -C /tmp/tippecanoe-src install PREFIX="$HOME/tippecanoe"
+      - run: echo "$HOME/tippecanoe/bin" >> "$GITHUB_PATH"
+      - name: Intermediates of all regions (orbis-osm/src)
+        run: |
+          mkdir -p work
+          aws s3 sync s3://orbis-osm/src work/src --exclude "*" --include "*/*.geojsonl" --include "*/info.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors
+          du -sh work/src/*
+      - name: Build PMTiles
+        run: |
+          tippecanoe --version
+          node collectors/osm-tiles.mjs build work/src dist
+          ls -laR dist
       - name: Upload to R2 (orbis-osm)
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
-          ls out
-          collectors/upload.sh out orbis-osm "public, max-age=86400" --collapse-manifest --replace-dirs
+          collectors/upload.sh dist orbis-osm "public, max-age=86400"
+          # the state file wants a shorter cache and goes last
+          aws s3 cp dist/meta.json s3://orbis-osm/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+            --cache-control "public, max-age=3600" --content-type application/json --only-show-errors
+      - name: Remove the old JSON tiles (no orphans)
+        run: |
+          aws s3 rm s3://orbis-osm/ --recursive --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors \
+            --exclude "*" --include "cctv-*" --include "blitzer-*" --include "alpr-*" --include "webcam-*" --include "wind-*" --include "resource-*"

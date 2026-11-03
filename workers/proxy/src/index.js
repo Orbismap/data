@@ -62,6 +62,10 @@ const UPSTREAM_TIMEOUT_MS = 20000;
 const OVERPASS_TIMEOUT_MS = 45000;
 const pending = new Map();
 
+// Workers-Preview-URLs der App (<alias>-orbis-site.malte9799.workers.dev) sind zusätzlich zur Liste erlaubt.
+const PREVIEW_ORIGIN = /^https:\/\/[a-z0-9-]+-orbis-site\.malte9799\.workers\.dev$/;
+const originAllowed = (allowed, origin) => allowed.includes(origin) || PREVIEW_ORIGIN.test(origin);
+
 function cors(origin) {
   return {
     'Access-Control-Allow-Origin': origin || '*',
@@ -75,7 +79,7 @@ export default {
   async fetch(request, env) {
     const origin = request.headers.get('Origin') ?? '';
     const allowed = (env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    if (allowed.length && !allowed.includes(origin)) return new Response('Origin not allowed', { status: 403, headers: cors(origin) });
+    if (allowed.length && !originAllowed(allowed, origin)) return new Response('Origin not allowed', { status: 403, headers: cors(origin) });
     const headers = cors(allowed.length ? origin : '*');
 
     if (request.method === 'OPTIONS') return new Response(null, { headers });
