@@ -10,5 +10,11 @@
   },
   "devDependencies": {
     "wrangler": "4.157.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
   }
 }
