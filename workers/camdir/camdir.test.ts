@@ -10,11 +10,11 @@ const OLD = {
   'cam:2': { d: 12.5, at: 1700000001000, p: { down: 10, alt: 5, roll: 0, fov: 60 }, pos: [11.4, 53.7] },
 };
 
-/** `old`: the object of the old KV key `dirs` (leave out for a fresh install without KV) */
-function setup(old?: Record<string, unknown>) {
+/** `seed`: entries that are in the table before the first request */
+function setup(seed?: Record<string, unknown>) {
   const db = fakeD1([migration]);
-  const store = new Map<string, string>(old ? [['dirs', JSON.stringify(old)]] : []);
-  const env: Record<string, unknown> = { DB: db, ADMIN_TOKEN: TOKEN, ...(old ? { CAMDIR: { get: async (k: string) => (store.has(k) ? JSON.parse(store.get(k)!) : null) } } : {}) };
+  for (const [k, v] of Object.entries(seed ?? {})) db.raw.prepare('INSERT INTO dirs (key, value, updated_at) VALUES (?, ?, ?)').run(k, JSON.stringify(v), (v as { at?: number }).at ?? null);
+  const env: Record<string, unknown> = { DB: db, ADMIN_TOKEN: TOKEN };
   const req = (method: string, path: string, body?: unknown, auth = true) =>
     worker.fetch(new Request(`https://w.example${path}`, { method, body: body ? JSON.stringify(body) : undefined, headers: auth ? { Authorization: `Bearer ${TOKEN}` } : {} }), env);
   const rows = () => (db.raw.prepare('SELECT key, value FROM dirs ORDER BY key').all() as { key: string; value: string }[]).map((r) => [r.key, JSON.parse(r.value)]);
@@ -82,38 +82,5 @@ describe('PUT and DELETE /dirs', () => {
     const { req, rows } = setup();
     await Promise.all([req('PUT', '/dirs', { key: 'a', dir: 1 }), req('PUT', '/dirs', { key: 'b', dir: 2 })]);
     expect(rows().map(([k]) => k)).toEqual(['a', 'b']);
-  });
-});
-
-describe('one-time import from KV', () => {
-  it('copies the old object once, idempotent, and later changes win', async () => {
-    const { req, rows, db } = setup(OLD);
-    await req('GET', '/dirs');
-    expect(rows()).toEqual(Object.entries(OLD));
-    expect((db.raw.prepare('SELECT updated_at FROM dirs WHERE key = ?').get('cam:1') as { updated_at: number }).updated_at).toBe(1700000000000);
-    await req('DELETE', '/dirs?key=cam:1');
-    await req('GET', '/dirs'); // same isolate: no second import
-    expect(rows().map(([k]) => k)).toEqual(['cam:2']);
-  });
-  it('a second isolate with its own marker check cannot bring back deleted entries', async () => {
-    const { env, db, rows } = setup(OLD);
-    const env2 = { ...env, DB: Object.create(env.DB as object) };
-    await Promise.all([worker.fetch(new Request('https://w.example/dirs'), env), worker.fetch(new Request('https://w.example/dirs'), env2)]);
-    expect(rows()).toHaveLength(2);
-    db.raw.prepare("DELETE FROM dirs WHERE key = 'cam:1'").run();
-    await worker.fetch(new Request('https://w.example/dirs'), { ...env, DB: Object.create(env.DB as object) }); // a "cold" isolate checks the marker, finds it, imports nothing
-    expect(rows().map(([k]) => k)).toEqual(['cam:2']);
-  });
-  it('imports big objects in chunks', async () => {
-    const big = Object.fromEntries(Array.from({ length: 1234 }, (_, i) => [`c${i}`, { d: i % 360, at: i }]));
-    const { req, rows } = setup(big);
-    const res = await (await req('GET', '/dirs')).json();
-    expect(Object.keys(res.dirs)).toHaveLength(1234);
-    expect(rows()).toHaveLength(1234);
-  });
-  it('works without the KV binding (after the cleanup)', async () => {
-    const { req } = setup();
-    expect((await req('PUT', '/dirs', { key: 'a', dir: 1 })).status).toBe(200);
-    expect(await (await req('GET', '/dirs')).json()).toMatchObject({ dirs: { a: { d: 1 } } });
   });
 });

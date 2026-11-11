@@ -7,7 +7,6 @@
 //
 // Setup: see "Fahrplan-Benachrichtigungen" in README.md. Needs
 //   • D1 database bound as DB (migrations in workers/push/migrations, see "D1" in README.md)
-//   • (temporary) KV namespace PUSH_KV, only read once to import the old data into D1
 //   • secrets VAPID_PUBLIC and VAPID_PRIVATE (node scripts/vapid-keys.mjs), variable VAPID_SUBJECT
 //     ("mailto:you@example.org")
 //   • cron trigger "* * * * *"
@@ -425,62 +424,9 @@ function forgetStatements(env, id) {
 }
 const forget = (env, id) => env.DB.batch(forgetStatements(env, id));
 
-// ---- one-time import from the old KV keys -------------------------------------------------------
-// TODO(KV-Import): about a week after the D1 rollout delete this block, the ensureImported() calls and the PUSH_KV
-// binding in wrangler.jsonc (the `meta` table stays harmlessly; see "D1" in README.md).
-//
-// The first request/cron run that finds no marker in `meta` copies KV `subs` and `sent:<id>` into D1. All statements
-// are guarded by "marker not set yet" and run in one batch (one transaction): when two isolates import at the same
-// time the second batch does nothing, and it can never bring back a subscription that was removed after the first
-// import. INSERT OR IGNORE keeps every statement idempotent.
-const NOT_IMPORTED = "NOT EXISTS (SELECT 1 FROM meta WHERE k = 'kv_import')";
-const importing = new WeakMap();
-
-async function importFromKv(env, now = Date.now()) {
-  if (await env.DB.prepare("SELECT 1 AS x FROM meta WHERE k = 'kv_import'").first()) return;
-  const doc = (await env.PUSH_KV.get('subs', 'json')) ?? {};
-  const stmts = [];
-  const ids = []; // [id in KV, id in D1] – the same unless the old key was not the hash of the endpoint
-  for (const [kvId, s] of Object.entries(doc)) {
-    if (ids.length >= MAX_SUBS) break;
-    const trips = dedupeTrips(Array.isArray(s?.trips) ? s.trips.slice(0, MAX_TRIPS) : []);
-    if (!pushEndpoint(s?.sub?.endpoint) || !s.sub.keys || !trips.length) continue;
-    const tz = validTz(s.tz) ? s.tz : 'Europe/Berlin';
-    const t = Number.isFinite(s.t) ? s.t : now;
-    const id = await subId(s.sub.endpoint);
-    ids.push([kvId, id]);
-    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO subscriptions (id, endpoint, keys, tz, created_at, updated_at) SELECT ?1, ?2, ?3, ?4, ?5, ?5 WHERE ${NOT_IMPORTED}`).bind(id, s.sub.endpoint, JSON.stringify(s.sub.keys), tz, t));
-    const rows = trips.map((tr) => ({ k: tr.id, d: JSON.stringify(tr), n: nextNotifyAt(tr, tr.tz || tz, now) }));
-    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO trips (sub_id, trip_key, data, notify_at) SELECT ?1, json_extract(value, '$.k'), json_extract(value, '$.d'), json_extract(value, '$.n') FROM json_each(?2) WHERE ${NOT_IMPORTED}`).bind(id, JSON.stringify(rows)));
-  }
-  // what was sent in the last days, so nothing is sent twice around the switch (reads in small groups)
-  for (let i = 0; i < ids.length; i += 10) {
-    const group = ids.slice(i, i + 10);
-    const sents = await Promise.all(group.map(([kvId]) => env.PUSH_KV.get(`sent:${kvId}`, 'json').catch(() => null)));
-    group.forEach(([, id], j) => {
-      const recent = Object.fromEntries(Object.entries(sents[j] ?? {}).filter(([, v]) => Number.isFinite(v) && now - v <= KEEP_SENT_MS));
-      if (Object.keys(recent).length) stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO sent (sub_id, key, sent_at) SELECT ?1, key, value FROM json_each(?2) WHERE ${NOT_IMPORTED}`).bind(id, JSON.stringify(recent)));
-    });
-  }
-  stmts.push(env.DB.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('kv_import', ?1)").bind(String(now)));
-  await env.DB.batch(stmts);
-}
-
-function ensureImported(env) {
-  if (!env.PUSH_KV) return Promise.resolve(); // binding removed: nothing to import any more
-  let p = importing.get(env.DB);
-  if (!p) {
-    p = importFromKv(env);
-    importing.set(env.DB, p);
-    p.catch(() => importing.delete(env.DB)); // try again with the next request
-  }
-  return p;
-}
-
 // ---- cron -----------------------------------------------------------------------------------
 
 export async function runDue(env, now = Date.now()) {
-  await ensureImported(env);
   // only trips with an open (or just opened) notification window; the others are not read at all
   const { results } = await env.DB.prepare('SELECT t.sub_id, t.data, t.notify_at, s.endpoint, s.keys, s.tz FROM trips t JOIN subscriptions s ON s.id = t.sub_id WHERE t.notify_at <= ?1 ORDER BY t.sub_id LIMIT 600').bind(now).all();
   const bySub = new Map();
@@ -601,7 +547,6 @@ async function handle(req, env, url) {
   if (typeof endpoint !== 'string' || !pushEndpoint(endpoint)) return 400;
   if (limited(`write|${ip}`, 30, 60000)) return 429;
   const id = await subId(endpoint);
-  await ensureImported(env);
   if (url.pathname === '/sync') {
     const sub = body.subscription;
     if (!validSub(sub) || !validTz(body.tz)) return 400;

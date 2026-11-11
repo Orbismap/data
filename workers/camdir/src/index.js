@@ -50,42 +50,6 @@ async function isAdmin(request, env) {
   return !!env.ADMIN_TOKEN && !!given && (await sameToken(given, env.ADMIN_TOKEN));
 }
 
-// ---- one-time import from the old KV key ---------------------------------------------------
-// TODO(KV-Import): about a week after the D1 rollout delete this block, the ensureImported() calls, the
-// CAMDIR binding in wrangler.jsonc and the `meta` table is then unused (see "D1" in README.md).
-//
-// The first request that finds no marker in `meta` copies the KV object `dirs` into the table. All statements
-// are guarded by "marker not set yet" and run in one batch (one transaction), so two isolates importing at the
-// same time cannot overwrite what was written after the first import. INSERT OR IGNORE keeps it idempotent.
-const NOT_IMPORTED = "NOT EXISTS (SELECT 1 FROM meta WHERE k = 'kv_import')";
-const importing = new WeakMap();
-
-async function importFromKv(env) {
-  const done = await env.DB.prepare("SELECT 1 AS x FROM meta WHERE k = 'kv_import'").first();
-  if (done) return;
-  const old = (await env.CAMDIR.get('dirs', 'json')) ?? {};
-  const entries = Object.entries(old).filter(([k, v]) => KEY_RE.test(k) && v && typeof v === 'object');
-  const stmts = [];
-  // chunks of 400 entries as one JSON object each, unpacked by json_each (keeps statements and parameters small)
-  for (let i = 0; i < entries.length; i += 400) {
-    const chunk = Object.fromEntries(entries.slice(i, i + 400));
-    stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO dirs (key, value, updated_at) SELECT key, value, json_extract(value, '$.at') FROM json_each(?1) WHERE ${NOT_IMPORTED}`).bind(JSON.stringify(chunk)));
-  }
-  stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO meta (k, v) VALUES ('kv_import', ?1)`).bind(String(Date.now())));
-  await env.DB.batch(stmts);
-}
-
-function ensureImported(env) {
-  if (!env.CAMDIR) return Promise.resolve(); // binding removed: nothing to import any more
-  let p = importing.get(env.DB);
-  if (!p) {
-    p = importFromKv(env);
-    importing.set(env.DB, p);
-    p.catch(() => importing.delete(env.DB)); // try again with the next request
-  }
-  return p;
-}
-
 // ---- storage -----------------------------------------------------------------------------------
 
 const readAll = async (env) => {
@@ -106,7 +70,6 @@ export default {
     if (!env.DB) return json({ error: 'D1 database DB is not bound' }, 500, headers);
 
     if (request.method === 'GET') {
-      await ensureImported(env);
       return json({ dirs: await readAll(env) }, 200, headers, { 'Cache-Control': 'public, max-age=60' });
     }
 
@@ -116,7 +79,6 @@ export default {
     if (request.method === 'DELETE') {
       const key = url.searchParams.get('key') ?? '';
       if (!KEY_RE.test(key)) return json({ error: 'bad key' }, 400, headers);
-      await ensureImported(env);
       await env.DB.prepare('DELETE FROM dirs WHERE key = ?1').bind(key).run();
       return json({ ok: true }, 200, headers);
     }
@@ -129,7 +91,6 @@ export default {
     }
     const dir = Number(body?.dir);
     if (!KEY_RE.test(String(body?.key ?? '')) || !Number.isFinite(dir) || dir < 0 || dir >= 360) return json({ error: 'bad key or dir' }, 400, headers);
-    await ensureImported(env);
     const exists = await env.DB.prepare('SELECT 1 AS x FROM dirs WHERE key = ?1').bind(body.key).first();
     if (!exists && (await env.DB.prepare('SELECT COUNT(*) AS n FROM dirs').first()).n >= MAX_ENTRIES) return json({ error: 'too many entries' }, 413, headers);
     const entry = { d: Math.round(dir * 10) / 10, at: Date.now() };

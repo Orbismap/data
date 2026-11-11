@@ -44,8 +44,8 @@ Der `name` in jeder `wrangler.jsonc` entspricht dem bereits deployten Worker, da
 | Ordner | Worker-Name | URL | Bindings / Trigger | Dashboard-Variablen |
 |---|---|---|---|---|
 | `workers/proxy` | `orbis` | `https://orbis.malte9799.workers.dev/` | - | `ALLOWED_ORIGINS`, optional `AISSTREAM_KEY` |
-| `workers/push` | `orbis-trains` | `https://orbis-trains.malte9799.workers.dev/` | D1 `DB` (`orbis-push`), Cron `* * * * *`; KV `PUSH_KV` (`orbis-push`) nur noch für den einmaligen Import | `DB_CLIENT_ID`, `DB_API_KEY`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, `VAPID_SUBJECT`, optional `ALLOWED_ORIGINS`, `DB_TIMETABLES_BASE` |
-| `workers/camdir` | `orbis-cams` | `https://orbis-cams.malte9799.workers.dev/` | D1 `DB` (`orbis-camdir`); KV `CAMDIR` (`orbis_cams`) nur noch für den einmaligen Import | `ADMIN_TOKEN`, optional `ALLOWED_ORIGINS` |
+| `workers/push` | `orbis-trains` | `https://orbis-trains.malte9799.workers.dev/` | D1 `DB` (`orbis-push`), Cron `* * * * *` | `DB_CLIENT_ID`, `DB_API_KEY`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, `VAPID_SUBJECT`, optional `ALLOWED_ORIGINS`, `DB_TIMETABLES_BASE` |
+| `workers/camdir` | `orbis-cams` | `https://orbis-cams.malte9799.workers.dev/` | D1 `DB` (`orbis-camdir`) | `ADMIN_TOKEN`, optional `ALLOWED_ORIGINS` |
 | `workers/clock` | `orbis-clock` | keine (`workers_dev: false`, `fetch` antwortet 404) | R2 `LIVE` (`orbis-live`), Cron `* * * * *` | Secret `GH_DISPATCH_TOKEN` (startet die GitHub-Actions-Sammler, siehe [Sammler](#sammler-collectors-und-github-actions)); ohne Secret loggt die Uhr das einmal und spiegelt weiter |
 
 ### D1 (Push und Camdir)
@@ -65,9 +65,7 @@ pnpm exec wrangler d1 migrations apply orbis-camdir --remote -c workers/camdir/w
 # lokal (wrangler dev): dasselbe mit --local
 ```
 
-**Einmaliger Import aus KV.** Die Worker lesen beim ersten Aufruf (pro Isolate; Marker `meta.k = 'kv_import'`) die alten KV-Schlüssel (`subs` und `sent:*` bzw. `dirs`) und schreiben sie in D1. Alle Import-Statements laufen in einem Batch (eine Transaktion) und sind mit „Marker noch nicht gesetzt“ abgesichert: Importieren zwei Isolates gleichzeitig, tut der zweite Batch nichts und kann nichts wiederbringen, was danach gelöscht wurde. Fehlschlag (z. B. KV-Fehler) lässt den Marker ungesetzt, der nächste Aufruf versucht es erneut. KV wird nur gelesen, nie verändert.
 
-**TODO (ca. eine Woche nach dem Rollout):** Import prüfen (`wrangler d1 execute orbis-push --remote --command "select * from meta"` zeigt `kv_import`), dann in beiden Workern das KV-Binding aus der `wrangler.jsonc` und den Block „one-time import“ samt `ensureImported()`-Aufrufen aus `src/index.js` löschen (ohne Binding überspringen die Worker den Import bereits von selbst), anschließend die KV-Namespaces `orbis-push` und `orbis_cams` löschen.
 
 D1-Free-Limits: 5 Mio. gelesene Zeilen und 100.000 geschriebene Zeilen pro Tag, 5 GB Speicher, 50 Abfragen pro Worker-Aufruf. Verbrauch: der Push-Cron liest dank `notify_at` nur Fahrten mit offenem Meldefenster (plus je eine Abfrage für `sent`-Aufräumen), Schreibzugriffe nur bei Sendungen, Abo-Änderungen und dem Weiterschieben von `notify_at`. `GET /dirs` liest alle Zeilen von `dirs` (bei 20.000 Einträgen = 20.000 Zeilen pro Aufruf, ca. 250 Aufrufe/Tag bis zum Limit; heute sind es deutlich weniger Einträge); der Browser darf die Antwort 60 s cachen.
 
