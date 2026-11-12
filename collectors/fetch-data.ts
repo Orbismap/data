@@ -516,7 +516,7 @@ await task('ukraine-support', 'weekly', async () => {
     if (head < 0) throw new Error('Kiel Tracker: Tabellenkopf nicht gefunden');
     const asOf = /between ([A-Z][a-z]+ \d+, \d{4}) and ([A-Z][a-z]+ \d+, \d{4})/.exec(rows.map((r) => r.B ?? r.A ?? '').join('\n'))?.[2] ?? '';
     // Geber-Positionen: Mittelpunkt des größten Polygons der Landesgrenze (Overrides für Gebiete mit Übersee-Teilen)
-    const geo = JSON.parse(readFileSync('public/data/games/countries.json', 'utf8')) as { features: { properties: { en: string }; geometry: { type: string; coordinates: any } }[] };
+    const geo = JSON.parse(readFileSync(join(__ORBIS_SRC__, 'public/data/games/countries.json'), 'utf8')) as { features: { properties: { en: string }; geometry: { type: string; coordinates: any } }[] };
     const OVERRIDE: Record<string, [number, number]> = {
       'United States of America': [39.8, -98.6], France: [46.6, 2.4], Netherlands: [52.2, 5.3], Norway: [61.0, 9.0], Denmark: [56.0, 10.0],
       'EU (Commission and Council)': [50.85, 4.35], 'European Investment Bank': [49.61, 6.13],
