@@ -46,6 +46,15 @@ export const SETS = ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'];
 /** pmtiles zoom range: single points down to z14 (no points dropped at max zoom unless a tile is huge), thinned out below */
 const MIN_ZOOM = 0;
 const MAX_ZOOM = 14;
+/**
+ * Sets the viewer draws from zoom 0 (cameras): below LOW_ZOOM_END their tiles carry a second, attribute-free layer
+ * `<set>_lo` instead of the full records. Every point stays visible: points that fall into the same cell of a
+ * LOW_GRID × LOW_GRID grid per tile (≈ half a screen pixel at 512 px tiles) are drawn on top of each other anyway, so
+ * one stands for them. The full layer `<set>` starts at LOW_ZOOM_END (the viewer reads `<set>_lo` below it).
+ */
+export const LOW_SETS = ['cctv', 'blitzer', 'alpr', 'webcam'];
+export const LOW_ZOOM_END = 6; // first zoom of the full layer; the `_lo` layer covers 0 .. LOW_ZOOM_END - 1
+export const LOW_GRID = 1024;
 
 /** record fields after [lon, lat] per set (= property names of the GeoJSON features) */
 export const FIELDS = {
@@ -303,6 +312,39 @@ async function heatCells(files) {
   });
 }
 
+/**
+ * Attribute-free copy of the points for the low zooms: for each zoom z < LOW_ZOOM_END one point per LOW_GRID cell of a
+ * tile (Web-Mercator), written as newline-delimited GeoJSON with `tippecanoe: {layer, minzoom: z, maxzoom: z}`.
+ * Returns the number of points per zoom.
+ */
+export async function lowZoomPoints(files, set, outFile) {
+  const out = createWriteStream(outFile);
+  const seen = Array.from({ length: LOW_ZOOM_END }, () => new Set());
+  const counts = new Array(LOW_ZOOM_END).fill(0);
+  for (const file of files) {
+    for await (const line of createInterface({ input: createReadStream(file), crlfDelay: Infinity })) {
+      if (!line) continue;
+      const c = JSON.parse(line).geometry?.coordinates;
+      if (!c) continue;
+      const [lon, lat] = c;
+      const wx = (lon + 180) / 360;
+      const sin = Math.sin((Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI) / 180);
+      const wy = 0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI);
+      for (let z = 0; z < LOW_ZOOM_END; z++) {
+        const n = 2 ** z * LOW_GRID;
+        const key = Math.min(n - 1, Math.floor(wx * n)) * n + Math.min(n - 1, Math.floor(wy * n));
+        if (seen[z].has(key)) continue;
+        seen[z].add(key);
+        counts[z]++;
+        if (!out.write(`{"type":"Feature","tippecanoe":{"layer":"${set}_lo","minzoom":${z},"maxzoom":${z}},"geometry":{"type":"Point","coordinates":[${lon},${lat}]},"properties":{}}\n`)) await once(out, 'drain');
+      }
+    }
+  }
+  out.end();
+  await once(out, 'finish');
+  return counts;
+}
+
 function run(cmd, args) {
   return new Promise((res, rej) => {
     const p = spawn(cmd, args, { stdio: 'inherit' });
@@ -331,12 +373,20 @@ async function build(srcDir, distDir) {
       continue;
     }
     // -r1: no thinning by rate; -b 0: no buffer (points would be duplicated into the neighbour tiles); --drop-densest-as-needed only where a tile gets too big (dense low zooms), -M/-O keep z14 complete
-    await run('tippecanoe', [
-      '-o', target, '--force', '-l', set, '-n', set, '-N', `OpenStreetMap ${set} points`,
-      '-Z', String(MIN_ZOOM), '-z', String(MAX_ZOOM), '-r1', '-b', '0', '--drop-densest-as-needed', '-M', '1000000', '-O', '250000',
-      '--read-parallel', '-q', '-A', '© OpenStreetMap contributors (ODbL)', ...files,
-    ]);
-    meta.sets[set] = { bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0) };
+    const common = ['--force', '-n', set, '-N', `OpenStreetMap ${set} points`, '-r1', '-b', '0', '--read-parallel', '-q', '-A', '© OpenStreetMap contributors (ODbL)'];
+    if (LOW_SETS.includes(set)) {
+      // Camera sets: z0..LOW_ZOOM_END-1 only one bare point per grid cell (layer <set>_lo, lowZoomPoints), nothing dropped;
+      // from LOW_ZOOM_END the full records (layer <set>); tile-join puts both zoom ranges into one file
+      const lo = join(distDir, `${set}-lo`);
+      meta.sets[set] = { lowZoomPoints: await lowZoomPoints(files, set, `${lo}.geojsonl`) };
+      await run('tippecanoe', ['-o', `${lo}.pmtiles`, '-l', `${set}_lo`, '-Z', '0', '-z', String(LOW_ZOOM_END - 1), '--no-feature-limit', '--no-tile-size-limit', ...common, `${lo}.geojsonl`]);
+      await run('tippecanoe', ['-o', `${join(distDir, `${set}-hi`)}.pmtiles`, '-l', set, '-Z', String(LOW_ZOOM_END), '-z', String(MAX_ZOOM), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...files]);
+      await run('tile-join', ['-o', target, '--force', '-pk', '-q', '-n', set, '-N', `OpenStreetMap ${set} points`, '-A', '© OpenStreetMap contributors (ODbL)', `${lo}.pmtiles`, `${join(distDir, `${set}-hi`)}.pmtiles`]);
+      for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${join(distDir, `${set}-hi`)}.pmtiles`]) rmSync(f, { force: true });
+    } else {
+      await run('tippecanoe', ['-o', target, '-l', set, '-Z', String(MIN_ZOOM), '-z', String(MAX_ZOOM), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...files]);
+    }
+    meta.sets[set] = { ...meta.sets[set], bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0) };
     console.log(`${set}: ${meta.sets[set].bytes} bytes`);
   }
   const cctv = used.map((r) => join(srcDir, r, 'cctv.geojsonl')).filter((f) => existsSync(f));

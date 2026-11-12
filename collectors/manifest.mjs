@@ -46,6 +46,8 @@ export const RULES = [
   [/^meta\.json$/, 'Orbismap/data collectors', 'n/a'],
   // orbis-osm
   [/^((cctv|blitzer|alpr|webcam|wind|resource)\.pmtiles|heat\/)/, 'OpenStreetMap, Geofabrik extracts (https://download.geofabrik.de)', ODBL],
+  // orbis-wetter
+  [/^v1\/static\/dem\//, 'Mapzen Terrain Tiles / Terrarium z5 (https://registry.opendata.aws/terrain-tiles; SRTM, GMTED2010, ETOPO1 u. a., https://github.com/tilezen/joerd/blob/master/docs/attribution.md), resampled to 0.5 deg / 0.125 deg OWX (collectors/wetter-dem.py)', 'AWS Open Data terrain tiles, free use with attribution of the underlying sources (SRTM/NASA public domain, GMTED2010/USGS public domain, ETOPO1/NOAA public domain)'],
   [/^LICENSE\.txt$/, 'Orbismap/data collectors', ODBL],
 ];
 

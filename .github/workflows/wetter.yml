@@ -89,6 +89,11 @@ jobs:
           if [ -d ../wetter-dem/v1/static ]; then
             aws s3 sync ../wetter-dem/v1/static "s3://$R2_BUCKET/v1/static" --endpoint-url "$EP" \
               --cache-control "public, max-age=86400" --content-type application/octet-stream --only-show-errors
+            # manifest.json of the bucket: source and licence of the heights (collectors/manifest.mjs)
+            aws s3 cp "s3://$R2_BUCKET/manifest.json" ../wetter-manifest-old.json --endpoint-url "$EP" --only-show-errors 2>/dev/null || echo '{}' > ../wetter-manifest-old.json
+            node collectors/manifest.mjs ../wetter-dem ../wetter-manifest-old.json ../wetter-manifest.json
+            aws s3 cp ../wetter-manifest.json "s3://$R2_BUCKET/manifest.json" --endpoint-url "$EP" \
+              --cache-control "public, max-age=3600" --content-type application/json --only-show-errors
           fi
           [ -f ../wetter-out/v1/latest.json ] || exit 0
           RUN=$(python -c "import json;print(json.load(open('../wetter-out/v1/latest.json'))['run'])")
