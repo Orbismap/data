@@ -22,6 +22,7 @@ export const THRESHOLDS = {
     ['space/tle/stations.txt', 6 * H],
     ['stuk-fi.json', 60 * MIN],
     ['hc-ca.json', 60 * MIN],
+    ['aircraft/opensky-states.json', 15 * MIN], // loop uploads every 90 s, the manifest entry is refreshed every ~6 min
   ],
   'orbis-data': [
     ['meta.json', 50 * H],

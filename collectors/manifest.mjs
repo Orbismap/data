@@ -43,6 +43,7 @@ export const RULES = [
   [/^cams\/world\.json$/, 'camera feeds listed in docs/DATENQUELLEN.md section 8 (positions only)', 'positions only; see per-feed terms in docs/DATENQUELLEN.md'],
   [/^cams\//, 'camera feed of the same name (src/api/camfeeds.ts)', 'per feed, see docs/DATENQUELLEN.md section 8'],
   [/^street\//, 'https://tiles.mapillary.com (Mapillary vector tiles)', 'Mapillary, CC BY-SA 4.0'],
+  [/^aircraft\/opensky-states\.json$/, 'https://opensky-network.org/api/states/all?extended=1 (central fetch every 90 s, collectors/opensky-loop.mjs)', 'OpenSky Network, free for research and non-commercial use, attribution (Schäfer et al., IPSN 2014); terms: https://opensky-network.org/about/terms-of-use'],
   [/^meta\.json$/, 'Orbismap/data collectors', 'n/a'],
   // orbis-osm
   [/^((cctv|blitzer|alpr|webcam|wind|resource)\.pmtiles|heat\/)/, 'OpenStreetMap, Geofabrik extracts (https://download.geofabrik.de)', ODBL],

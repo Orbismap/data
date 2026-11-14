@@ -1,0 +1,39 @@
+name: OpenSky loop
+
+# Central OpenSky fetch for the aircraft overview of Orbis: states/all every 90 s -> orbis-live/aircraft/opensky-states.json.
+# Started by the clock worker (workers/clock) via repository_dispatch, type `opensky`, every hour; manually via "Run workflow".
+# No schedule here: the Cloudflare cron is the clock. Collector: collectors/opensky-loop.mjs (runs ~5 h 50 min, then exits).
+# Credits: 4 per fetch, 4000 per day -> never faster than 90 s. Two loops at once would double that, hence the concurrency
+# group: a dispatch during a running loop waits (GitHub keeps ONE pending run, newer ones replace it) and starts when the loop ends.
+
+on:
+  repository_dispatch:
+    types: [opensky]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opensky
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: OpenSky loop
+        env:
+          OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          LOOP_MINUTES: 350
+          INTERVAL_S: 90
+        run: node collectors/opensky-loop.mjs --out out/aircraft
