@@ -43,6 +43,8 @@ export const RULES = [
   [/^cams\/world\.json$/, 'camera feeds listed in docs/DATENQUELLEN.md section 8 (positions only)', 'positions only; see per-feed terms in docs/DATENQUELLEN.md'],
   [/^cams\//, 'camera feed of the same name (src/api/camfeeds.ts)', 'per feed, see docs/DATENQUELLEN.md section 8'],
   [/^street\//, 'https://tiles.mapillary.com (Mapillary vector tiles)', 'Mapillary, CC BY-SA 4.0'],
+  [/^ais\/barentswatch-area\.json$/, 'https://live.ais.barentswatch.no/v1/openaisarea (once per loop run, collectors/barentswatch-loop.mjs)', 'BarentsWatch / Kystverket (Norwegian Coastal Administration), NLOD 2.0; terms: https://www.barentswatch.no/en/articles/api-terms-and-conditions/'],
+  [/^ais\/barentswatch-latest\.json$/, 'https://live.ais.barentswatch.no/v1/latest/combined (central fetch every 60 s, collectors/barentswatch-loop.mjs)', 'BarentsWatch / Kystverket (Norwegian Coastal Administration), NLOD 2.0; terms: https://www.barentswatch.no/en/articles/api-terms-and-conditions/'],
   [/^aircraft\/opensky-states\.json$/, 'https://opensky-network.org/api/states/all?extended=1 (central fetch every 90 s, collectors/opensky-loop.mjs)', 'OpenSky Network, free for research and non-commercial use, attribution (Schäfer et al., IPSN 2014); terms: https://opensky-network.org/about/terms-of-use'],
   [/^meta\.json$/, 'Orbismap/data collectors', 'n/a'],
   // orbis-osm

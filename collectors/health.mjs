@@ -23,6 +23,7 @@ export const THRESHOLDS = {
     ['stuk-fi.json', 60 * MIN],
     ['hc-ca.json', 60 * MIN],
     ['aircraft/opensky-states.json', 15 * MIN], // loop uploads every 90 s, the manifest entry is refreshed every ~6 min
+    ['ais/barentswatch-latest.json', 15 * MIN], // loop uploads every 60 s, the manifest entry is refreshed every ~6 min
   ],
   'orbis-data': [
     ['meta.json', 50 * H],
