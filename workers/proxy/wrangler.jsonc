@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "keep_vars": true, // schützt nur im Dashboard gesetzte Variablen, die NICHT in dieser Datei stehen
-  "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" }
+  "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://maps.maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" }
   // Secrets im Dashboard setzen (hier NICHT als Werte):
   //   AISSTREAM_KEY    Secret, optional (Schiffe weltweit)
 }
