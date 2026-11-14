@@ -113,6 +113,8 @@ export const DISPATCH = [
   // group keeps ONE pending run (a newer dispatch replaces it), so the pending run starts right when the loop ends (no gap), and a
   // loop that died early is replaced within the hour. Never dispatch more often than that: the loop itself spends the credits.
   { id: 'opensky', event: 'opensky', minutes: [3] },
+  // BarentsWatch loop (collectors/barentswatch-loop.mjs, Norwegian AIS): the same pattern as the OpenSky loop, one run ~5 h 50 min.
+  { id: 'barentswatch', event: 'barentswatch', minutes: [4] },
   { id: 'health', event: 'health', minutes: [45] }, // hourly staleness check (collectors/health.mjs), opens/closes the issue "Datenstatus: Probleme"
   { id: 'daily', event: 'daily', hours: [3], minutes: [5] },
   { id: 'weekly', event: 'weekly', days: [1], hours: [4], minutes: [5] }, // Mondays

@@ -17,6 +17,16 @@ describe('dispatchDue', () => {
   });
 });
 
+describe('barentswatch dispatch', () => {
+  it('runs hourly, once', () => {
+    const bw = DISPATCH.filter((d: { event: string }) => d.event === 'barentswatch');
+    expect(bw).toHaveLength(1);
+    let n = 0;
+    for (let m = 0; m < 24 * 60; m++) n += dispatchDue(bw, new Date(Date.UTC(2026, 10, 16, 0, m))).length;
+    expect(n).toBe(24);
+  });
+});
+
 describe('opensky dispatch', () => {
   const opensky = DISPATCH.filter((d: { event: string }) => d.event === 'opensky');
   it('exists once, with the workflow event name', () => {

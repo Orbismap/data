@@ -110,6 +110,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 |---|---|---|---|---|
 | `live-15m.yml` (`live-15m`) | :07, :22, :37, :52 | `fetch-data.ts --group live-15m` | `orbis-live` | 35 min |
 | `opensky.yml` (`opensky`) | stündlich, :03 | `opensky-loop.mjs` (Schleife, siehe [OpenSky-Schleife](#opensky-schleife-flugzeug-überblick)) | `orbis-live` | 360 min |
+| `barentswatch.yml` (`barentswatch`) | stündlich, :04 | `barentswatch-loop.mjs` (Schleife, siehe [BarentsWatch-Schleife](#barentswatch-schleife-schiffe-norwegen)) | `orbis-live` | 360 min |
 | `live-1h.yml` (`live-1h`) | :12, alle 2 h (gerade UTC-Stunden) | `fetch-data.ts --group live-1h` | `orbis-live` | 20 min |
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
@@ -162,6 +163,18 @@ Der weltweite Flugzeug-Überblick der App kommt aus **einem** zentralen OpenSky-
 - **Testlauf:** *Actions → OpenSky loop → Run workflow* (Branch `main`). Im Log sollten nach wenigen Sekunden `credits remaining: …` und `round 0: … uploaded` stehen. `token HTTP 401/403` = falsche Client-Daten; `states HTTP 403` oder Zeitüberschreitung (`TimeoutError`) = OpenSky blockt die GitHub-Runner-IPs; `rate limited` = Tageskontingent verbraucht (Testlauf kostet 4 Credits je Runde, danach den Lauf abbrechen). Ohne OpenSky-Secrets (lokal, Forks) macht das Skript nur einen anonymen Abruf nach `--out` (`node collectors/opensky-loop.mjs --out ./out/aircraft`) und lädt nichts hoch.
 - **Lizenz:** OpenSky Network, frei für Forschung und nicht-kommerzielle Nutzung, Namensnennung (Schäfer et al., IPSN 2014), Bedingungen: https://opensky-network.org/about/terms-of-use. Das ist keine offene Lizenz im Sinn von CC; eine kommerzielle Nutzung bräuchte Rücksprache mit OpenSky. Der Eintrag im Manifest steht in `RULES` (`collectors/manifest.mjs`).
 
+### BarentsWatch-Schleife (Schiffe Norwegen)
+
+Die Schiffe vor Norwegen (Kystverket-Landstationen, Equinor-Offshore-Stationen, norwegische Satelliten) kommen aus **einem** zentralen BarentsWatch-Abruf. Die API braucht einen OAuth2-Client, dessen Secret nie in den Browser darf; außerdem reicht so ein Abruf für alle Besucher.
+
+- `collectors/barentswatch-loop.mjs` (Workflow `barentswatch.yml`) holt `https://live.ais.barentswatch.no/v1/latest/combined?since=<jetzt − 30 min>&modelType=Full&modelFormat=Json` (Token: `POST https://id.barentswatch.no/connect/token`, `grant_type=client_credentials`, `scope=ais`, Token 1 h, Erneuerung 5 min vor Ablauf und bei 401) **alle 60 s** und lädt die rohe Antwort (JSON-Array `AisComboFull`: Position + Stammdaten je MMSI) gzip-komprimiert als `ais/barentswatch-latest.json` nach `orbis-live` (`Cache-Control: public, max-age=45, stale-while-revalidate=120`). Die App liest sie mit dem Parser `barentswatchLatest`.
+- **Abdeckungsgebiet:** Zu Beginn jedes Laufs holt die Schleife `v1/openaisarea` (GeoJSON-MultiPolygon, gleiches Token) und legt es als `ais/barentswatch-area.json` ab (`Cache-Control: max-age=21600`). Die App zeichnet es als gestrichelte Umrandung. Schlägt der Abruf fehl, bleibt das alte Gebiet stehen; die Positionen laufen weiter.
+- **Abdeckung:** norwegische Wirtschaftszone, Fischereischutzzone Svalbard, Schutzzone Jan Mayen; ohne Fischereifahrzeuge unter 15 m und Freizeitboote unter 45 m (Vorgabe von BarentsWatch).
+- **Fehler:** Eine fehlgeschlagene Runde (HTTP-Fehler, weniger als 100 Schiffe, neueste Meldung älter als 15 min) lässt das alte Objekt stehen. 15 Fehlrunden in Folge beenden den Lauf; der nächste stündliche Dispatch (:04) startet eine neue Schleife. Überlappung wie bei OpenSky über `concurrency: barentswatch`.
+- **Secrets:** `BARENTSWATCH_CLIENT_ID` (Form `email:clientname`), `BARENTSWATCH_CLIENT_SECRET`: auf barentswatch.no registrieren, unter *Min side → API-tilgang* einen Client für die **AIS**-API anlegen. Danach die Uhr neu deployen (`pnpm deploy:clock`); der Workflow muss auf `main` liegen.
+- **Testlauf:** *Actions → BarentsWatch loop → Run workflow*. Im Log sollte `round 0: … ships … uploaded` stehen; `token HTTP 400/401` = falsche Client-Daten oder falscher Scope. Ohne Secrets beendet sich das Skript sofort (die API kennt keinen anonymen Zugang).
+- **Lizenz:** NLOD 2.0 (Norsk lisens for offentlige data), Quellenangabe „BarentsWatch / Kystverket“. Bedingungen: https://www.barentswatch.no/en/articles/api-terms-and-conditions/
+
 ### OSM-Punktdaten (PMTiles)
 
 `collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen sechs Datensätze, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Datensatz, Zoom 0–14, nur Knoten, ODbL):
@@ -205,6 +218,7 @@ Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mi
 | `FIRMS_MAP_KEY`, `NPS_API_KEY`, `WINDY_KEY`, `VICTORIA_KEY`, `CTA_KEY`, `TRAFIKLAB_KEY`, `TRAFIKVERKET_KEY`, `UTAH_511_API_KEY`, `ARIZONA_511_API_KEY`, `IDAHO_511_API_KEY`, `NEVADA_511_API_KEY`, `ALASKA_511_API_KEY`, `GEORGIA_511_API_KEY`, `LOUISIANA_511_API_KEY`, `PENNSYLVANIA_511_API_KEY`, `OHGO_API_KEY`, `QLDTRAFFIC_KEY`, `ONTARIO_511_API_KEY`, `ALBERTA_511_API_KEY` | Secret | API-Schlüssel der Datenquellen, aus `malte9799/orbis` kopieren (gleiche Namen wie in der alten `data.yml`) |
 | `MAPILLARY_TOKEN` | Secret (oder Variable) | Street-Panos; Workflow liest `secrets.MAPILLARY_TOKEN \|\| vars.MAPILLARY_TOKEN` |
 | `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | Secret | OAuth2-Client von OpenSky für die Schleife `opensky.yml` (siehe [OpenSky-Schleife](#opensky-schleife-flugzeug-überblick)) |
+| `BARENTSWATCH_CLIENT_ID`, `BARENTSWATCH_CLIENT_SECRET` | Secret | OAuth2-Client (AIS-API) von BarentsWatch für die Schleife `barentswatch.yml` (siehe [BarentsWatch-Schleife](#barentswatch-schleife-schiffe-norwegen)) |
 | `R2_BUCKET_WETTER`, `WETTER_PUBLIC_URL` | Variable, optional | Standard `orbis-wetter` und `https://orbis-wetter.maltee.dev` |
 | `GH_DISPATCH_TOKEN` | **Secret des Clock-Workers** (kein GitHub-Secret): `pnpm exec wrangler secret put GH_DISPATCH_TOKEN -c workers/clock/wrangler.jsonc` | Fine-grained Personal Access Token: *Repository access* nur `Orbismap/data`, Berechtigung *Contents: Read and write*. Das verlangt `POST /repos/{owner}/{repo}/dispatches` laut GitHub-Doku (fine-grained: „Contents“ write). Der Token muss der Org gehören bzw. von ihr zugelassen sein (Org-Einstellung für Fine-grained PATs). |
 
