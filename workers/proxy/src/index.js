@@ -123,7 +123,8 @@ export default {
   },
 };
 
-// WebSocket relay to aisstream.io: the browser sends only {BoundingBoxes}, the worker adds the key.
+// WebSocket relay to aisstream.io: the browser sends only {BoundingBoxes}, the worker adds the key. Message types: positions
+// (class A and B) and static data (ShipStaticData for class A, StaticDataReport for class B: name, type, dimensions).
 async function aisRelay(request, env, headers) {
   if (request.headers.get('Upgrade') !== 'websocket') return new Response('Expected WebSocket', { status: 426, headers });
   if (!env.AISSTREAM_KEY) return new Response('AISSTREAM_KEY not configured', { status: 503, headers });
@@ -137,7 +138,7 @@ async function aisRelay(request, env, headers) {
       const boxes = JSON.parse(String(ev.data)).BoundingBoxes;
       if (!Array.isArray(boxes) || boxes.length > 4) return;
       upstream.send(
-        JSON.stringify({ APIKey: env.AISSTREAM_KEY, BoundingBoxes: boxes, FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ShipStaticData'] }),
+        JSON.stringify({ APIKey: env.AISSTREAM_KEY, BoundingBoxes: boxes, FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ShipStaticData', 'StaticDataReport'] }),
       );
     } catch {
       /* ignore malformed subscriptions */
