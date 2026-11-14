@@ -109,6 +109,10 @@ export const DISPATCH = [
   // per run, hourly that is ~9,800/day against the free limit of 10,000/day per IP, and GitHub runner IPs are shared.
   // Every 2 h = ~4,900/day.
   { id: 'live-1h', event: 'live-1h', hours: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22], minutes: [12] },
+  // OpenSky loop (collectors/opensky-loop.mjs): one run lasts ~5 h 50 min. Dispatched hourly on purpose: the workflow's concurrency
+  // group keeps ONE pending run (a newer dispatch replaces it), so the pending run starts right when the loop ends (no gap), and a
+  // loop that died early is replaced within the hour. Never dispatch more often than that: the loop itself spends the credits.
+  { id: 'opensky', event: 'opensky', minutes: [3] },
   { id: 'health', event: 'health', minutes: [45] }, // hourly staleness check (collectors/health.mjs), opens/closes the issue "Datenstatus: Probleme"
   { id: 'daily', event: 'daily', hours: [3], minutes: [5] },
   { id: 'weekly', event: 'weekly', days: [1], hours: [4], minutes: [5] }, // Mondays

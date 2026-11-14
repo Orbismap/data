@@ -109,6 +109,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | Workflow (`event_type`) | Dispatch (UTC) | Sammler | Ziel-Bucket | Timeout |
 |---|---|---|---|---|
 | `live-15m.yml` (`live-15m`) | :07, :22, :37, :52 | `fetch-data.ts --group live-15m` | `orbis-live` | 35 min |
+| `opensky.yml` (`opensky`) | stündlich, :03 | `opensky-loop.mjs` (Schleife, siehe [OpenSky-Schleife](#opensky-schleife-flugzeug-überblick)) | `orbis-live` | 360 min |
 | `live-1h.yml` (`live-1h`) | :12, alle 2 h (gerade UTC-Stunden) | `fetch-data.ts --group live-1h` | `orbis-live` | 20 min |
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
@@ -147,6 +148,19 @@ node collectors/manifest.mjs ./out - ./out-manifest.json                        
 ```
 
 Ohne `ORBIS_SRC` erwartet `build.mjs` den Checkout unter `./orbis` (so wie in CI). `osm-tiles.mjs` braucht `osmium` und `tippecanoe` und lädt einen Geofabrik-Auszug (siehe „OSM-Punktdaten (PMTiles)“, lokal mit einem kleinen Auszug testen); `wetter-icon.py` braucht `pip install -r collectors/wetter-requirements.txt`.
+
+### OpenSky-Schleife (Flugzeug-Überblick)
+
+Der weltweite Flugzeug-Überblick der App kommt aus **einem** zentralen OpenSky-Abruf statt aus einem Abruf je Besucher. OpenSky blockt Cloudflare (der Proxy-Worker bekommt 522) und sendet kein CORS für fremde Origins; direkt aus dem Browser geht es also auch nicht.
+
+- `collectors/opensky-loop.mjs` (Workflow `opensky.yml`) holt `https://opensky-network.org/api/states/all?extended=1` mit OAuth2 (Client Credentials, Token-Endpunkt `auth.opensky-network.org/.../openid-connect/token`, Token ~30 min, Erneuerung 2 min vor Ablauf und bei 401) **alle 90 s** (gemessen ab Abrufbeginn, kein Aufsummieren der Laufzeit) und lädt die rohe Antwort gzip-komprimiert als `aircraft/opensky-states.json` nach `orbis-live` (`Content-Encoding: gzip`, `Cache-Control: public, max-age=60, stale-while-revalidate=120`, rund 275 KB). Die App liest die Datei mit dem vorhandenen Parser `openskyStates`.
+- **Credits:** ein weltweites `states/all` kostet 4 Credits, das Tageskontingent ist 4000 → höchstens 1000 Abrufe/Tag (alle 86 s). Bei 90 s sind es 960 Abrufe = 3840 Credits/Tag. Das Intervall fällt auch per Konfiguration nie unter 90 s. Bei 429 wartet die Schleife `X-Rate-Limit-Retry-After-Seconds`; je Runde steht `X-Rate-Limit-Remaining` im Log.
+- **Fehler:** Eine fehlgeschlagene Runde (HTTP-Fehler, leere/zu kurze Liste < 500 Flugzeuge, Zeitfeld `time` älter als 10 min) lässt das alte Objekt stehen. 12 Fehlrunden in Folge (~18 min) beenden den Lauf mit Fehler; der nächste stündliche Dispatch startet eine neue Schleife.
+- **Laufzeit und Überlappung:** Eine Schleife läuft 350 min (`LOOP_MINUTES`, Job-Limit 360) und endet sauber. Die Uhr dispatcht `opensky` **stündlich** (:03). Der Workflow hat `concurrency: opensky` ohne Abbruch: ein Dispatch während einer laufenden Schleife wartet, GitHub hält nur **einen** wartenden Lauf (neuere ersetzen ihn, diese Läufe erscheinen als „cancelled“, die Gesundheitsprüfung ignoriert sie). Der wartende Lauf startet sofort, wenn die Schleife endet (keine Lücke); eine früh gestorbene Schleife wird innerhalb einer Stunde ersetzt. Zwei Schleifen laufen nie gleichzeitig, das würde die Credits verdoppeln. Eine neue Schleife prüft zudem das Alter des Objekts und wartet bis zu 90 s, falls der letzte Abruf jünger ist. Ein manueller Lauf (*Run workflow*) wartet ebenfalls in der Gruppe.
+- **Manifest:** `aircraft/opensky-states.json` wird in der ersten Runde und danach etwa alle 6 min in `manifest.json` eingetragen (nicht bei jedem Abruf). `health.mjs` verlangt ein Alter ≤ 15 min.
+- **Secrets** (*Settings → Secrets and variables → Actions*): `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` (API-Client des OpenSky-Kontos), dazu die vorhandenen `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` (Schreibrecht auf `orbis-live`). Danach die Uhr neu deployen (`pnpm deploy:clock`), damit der Dispatch `opensky` startet; der Workflow muss auf `main` liegen.
+- **Testlauf:** *Actions → OpenSky loop → Run workflow* (Branch `main`). Im Log sollten nach wenigen Sekunden `credits remaining: …` und `round 0: … uploaded` stehen. `token HTTP 401/403` = falsche Client-Daten; `states HTTP 403` oder Zeitüberschreitung (`TimeoutError`) = OpenSky blockt die GitHub-Runner-IPs; `rate limited` = Tageskontingent verbraucht (Testlauf kostet 4 Credits je Runde, danach den Lauf abbrechen). Ohne OpenSky-Secrets (lokal, Forks) macht das Skript nur einen anonymen Abruf nach `--out` (`node collectors/opensky-loop.mjs --out ./out/aircraft`) und lädt nichts hoch.
+- **Lizenz:** OpenSky Network, frei für Forschung und nicht-kommerzielle Nutzung, Namensnennung (Schäfer et al., IPSN 2014), Bedingungen: https://opensky-network.org/about/terms-of-use. Das ist keine offene Lizenz im Sinn von CC; eine kommerzielle Nutzung bräuchte Rücksprache mit OpenSky. Der Eintrag im Manifest steht in `RULES` (`collectors/manifest.mjs`).
 
 ### OSM-Punktdaten (PMTiles)
 
@@ -190,6 +204,7 @@ Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mi
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Secret | R2-S3-Token mit Schreibrecht auf `orbis-live`, `orbis-data`, `orbis-osm`, `orbis-wetter` (getrennte Tokens je Bucket brauchen getrennte Secret-Namen, dann in den Workflows anpassen) |
 | `FIRMS_MAP_KEY`, `NPS_API_KEY`, `WINDY_KEY`, `VICTORIA_KEY`, `CTA_KEY`, `TRAFIKLAB_KEY`, `TRAFIKVERKET_KEY`, `UTAH_511_API_KEY`, `ARIZONA_511_API_KEY`, `IDAHO_511_API_KEY`, `NEVADA_511_API_KEY`, `ALASKA_511_API_KEY`, `GEORGIA_511_API_KEY`, `LOUISIANA_511_API_KEY`, `PENNSYLVANIA_511_API_KEY`, `OHGO_API_KEY`, `QLDTRAFFIC_KEY`, `ONTARIO_511_API_KEY`, `ALBERTA_511_API_KEY` | Secret | API-Schlüssel der Datenquellen, aus `malte9799/orbis` kopieren (gleiche Namen wie in der alten `data.yml`) |
 | `MAPILLARY_TOKEN` | Secret (oder Variable) | Street-Panos; Workflow liest `secrets.MAPILLARY_TOKEN \|\| vars.MAPILLARY_TOKEN` |
+| `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | Secret | OAuth2-Client von OpenSky für die Schleife `opensky.yml` (siehe [OpenSky-Schleife](#opensky-schleife-flugzeug-überblick)) |
 | `R2_BUCKET_WETTER`, `WETTER_PUBLIC_URL` | Variable, optional | Standard `orbis-wetter` und `https://orbis-wetter.maltee.dev` |
 | `GH_DISPATCH_TOKEN` | **Secret des Clock-Workers** (kein GitHub-Secret): `pnpm exec wrangler secret put GH_DISPATCH_TOKEN -c workers/clock/wrangler.jsonc` | Fine-grained Personal Access Token: *Repository access* nur `Orbismap/data`, Berechtigung *Contents: Read and write*. Das verlangt `POST /repos/{owner}/{repo}/dispatches` laut GitHub-Doku (fine-grained: „Contents“ write). Der Token muss der Org gehören bzw. von ihr zugelassen sein (Org-Einstellung für Fine-grained PATs). |
 
