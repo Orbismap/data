@@ -49,7 +49,7 @@ function levelOf(tags) {
   if (!s) return undefined;
   const parts = s.split(/[;,]/).map((p) => p.trim()).filter(Boolean);
   const nums = parts.map((p) => Number(p)).filter((n) => Number.isFinite(n));
-  if (nums.length) return Math.round(nums[0]);
+  if (nums.length) return nums[0];
   return undefined;
 }
 
