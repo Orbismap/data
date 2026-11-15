@@ -181,7 +181,12 @@ async function main() {
   let done = 0, skipped = 0, failed = 0;
   for (const a of airports) {
     const outFs = fileURLToPath(new URL(`${a.icao}.json`, OUT_DIR));
-    if (args.skipExisting && existsSync(outFs)) { skipped++; continue; }
+    if (args.skipExisting && existsSync(outFs)) {
+      try {
+        const existing = JSON.parse(readFileSync(outFs, 'utf8'));
+        if (Array.isArray(existing.indoor)) { skipped++; continue; }
+      } catch {}
+    }
     const bbox = [
       (a.lon - 0.035).toFixed(6),
       (a.lat - 0.025).toFixed(6),
