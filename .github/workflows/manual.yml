@@ -52,8 +52,7 @@ jobs:
           path: orbis
           sparse-checkout: |
             src
-            public/data/games
-            public/data/airports.json
+            public/data
       - uses: pnpm/action-setup@v4
         with:
           version: 10
