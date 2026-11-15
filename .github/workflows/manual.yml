@@ -7,18 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: 'Aufgabe: manual (fetch-data) oder indoor (Indoor-Pläne bauen)'
+        description: 'Aufgabe: manual, indoor (Overpass), oder indoor-osmium (Bulk per PBF)'
         type: choice
         options:
           - manual
           - indoor
+          - indoor-osmium
         default: manual
       group:
         description: 'Sammler-Gruppe (nur bei task=manual)'
         type: string
         default: manual
       indoor_limit:
-        description: 'Optional: max. Anzahl Flughäfen für Indoor-Build (nur task=indoor)'
+        description: 'Optional: max. Anzahl Flughäfen (indoor/indoor-osmium)'
         type: string
         default: ''
       orbis_ref:
@@ -81,7 +82,15 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: collectors/upload.sh out orbis-data "public, max-age=86400, stale-while-revalidate=604800"
-      - name: Build indoor plans
+      - name: Install osmium-tool
+        if: ${{ env.TASK == 'indoor-osmium' }}
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool
+      - name: Download OSM PBF (Europe)
+        if: ${{ env.TASK == 'indoor-osmium' }}
+        run: |
+          mkdir -p /tmp/osm
+          wget -q --show-progress https://download.geofabrik.de/europe-latest.osm.pbf -O /tmp/osm/europe-latest.osm.pbf
+      - name: Build indoor plans (overpass)
         if: ${{ env.TASK == 'indoor' }}
         run: |
           if [ -n "$INDOOR_LIMIT" ]; then
@@ -89,8 +98,16 @@ jobs:
           else
             node collectors/build-indoor.mjs --skip-existing
           fi
+      - name: Build indoor plans (osmium)
+        if: ${{ env.TASK == 'indoor-osmium' }}
+        run: |
+          if [ -n "$INDOOR_LIMIT" ]; then
+            node collectors/build-indoor-osmium.mjs --pbf /tmp/osm/europe-latest.osm.pbf --limit "$INDOOR_LIMIT" --skip-existing
+          else
+            node collectors/build-indoor-osmium.mjs --pbf /tmp/osm/europe-latest.osm.pbf --skip-existing
+          fi
       - name: Upload indoor to R2 (orbis-assets)
-        if: ${{ env.TASK == 'indoor' }}
+        if: ${{ env.TASK == 'indoor' || env.TASK == 'indoor-osmium' }}
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
