@@ -6,10 +6,21 @@ name: Collect manual
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: 'Aufgabe: manual (fetch-data) oder indoor (Indoor-Pläne bauen)'
+        type: choice
+        options:
+          - manual
+          - indoor
+        default: manual
       group:
-        description: 'Sammler-Gruppe (fetch-data.ts --group)'
+        description: 'Sammler-Gruppe (nur bei task=manual)'
         type: string
         default: manual
+      indoor_limit:
+        description: 'Optional: max. Anzahl Flughäfen für Indoor-Build (nur task=indoor)'
+        type: string
+        default: ''
       orbis_ref:
         description: 'Branch/Tag/SHA von malte9799/orbis für die gemeinsamen Loader'
         type: string
@@ -19,12 +30,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: manual
+  group: manual-${{ github.event.inputs.task || 'manual' }}
   cancel-in-progress: false
 
 env:
   ORBIS_REF: ${{ github.event.inputs.orbis_ref || 'main' }}
   COLLECT_GROUP: ${{ github.event.inputs.group || 'manual' }}
+  TASK: ${{ github.event.inputs.task || 'manual' }}
+  INDOOR_LIMIT: ${{ github.event.inputs.indoor_limit || '' }}
 
 jobs:
   collect:
@@ -49,12 +62,34 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Collect manual
+        if: ${{ env.TASK == 'manual' }}
         run: |
           pnpm exec node collectors/build.mjs
           node dist/fetch-data.mjs --group "$COLLECT_GROUP" --out out
       - name: Upload to R2 (orbis-data)
+        if: ${{ env.TASK == 'manual' }}
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: collectors/upload.sh out orbis-data "public, max-age=86400, stale-while-revalidate=604800"
+      - name: Build indoor plans
+        if: ${{ env.TASK == 'indoor' }}
+        run: |
+          if [ -n "$INDOOR_LIMIT" ]; then
+            node collectors/build-indoor.mjs --limit "$INDOOR_LIMIT" --skip-existing
+          else
+            node collectors/build-indoor.mjs --skip-existing
+          fi
+      - name: Upload indoor to R2 (orbis-assets)
+        if: ${{ env.TASK == 'indoor' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          if [ -d public/data/indoor ]; then
+            collectors/upload.sh public/data/indoor orbis-assets "public, max-age=2592000, stale-while-revalidate=604800"
+          else
+            echo "No public/data/indoor directory, nothing to upload."
+          fi
