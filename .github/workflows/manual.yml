@@ -24,7 +24,7 @@ on:
       orbis_ref:
         description: 'Branch/Tag/SHA von malte9799/orbis für die gemeinsamen Loader'
         type: string
-        default: main
+        default: feat/flughafen-merged-selfhosted
 
 permissions:
   contents: read
@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ORBIS_REF: ${{ github.event.inputs.orbis_ref || 'main' }}
+  ORBIS_REF: ${{ github.event.inputs.orbis_ref || 'feat/flughafen-merged-selfhosted' }}
   COLLECT_GROUP: ${{ github.event.inputs.group || 'manual' }}
   TASK: ${{ github.event.inputs.task || 'manual' }}
   INDOOR_LIMIT: ${{ github.event.inputs.indoor_limit || '' }}
