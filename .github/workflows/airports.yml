@@ -102,10 +102,19 @@ jobs:
             echo "PBF already cached: $PBF"
           fi
           echo "PBF_PATH=$PBF" >> "$GITHUB_ENV"
+      - name: Filter PBF (aeroway + indoor + building:part)
+        run: |
+          FILTERED="/tmp/osm-pbf/${{ matrix.region }}-filtered.osm.pbf"
+          if [ ! -f "$FILTERED" ]; then
+            osmium tags-filter "$PBF_PATH" -o "$FILTERED" --overwrite nwr/aeroway nwr/indoor nwr/building:part
+          else
+            echo "Filtered PBF already cached: $FILTERED"
+          fi
+          echo "FILTERED_PATH=$FILTERED" >> "$GITHUB_ENV"
       - name: Build airport plans (${{ matrix.region }})
-        run: node collectors/build-airportplan-osmium.mjs --pbf "$PBF_PATH" --region "${{ matrix.region }}" --skip-existing
+        run: node collectors/build-airportplan-osmium.mjs --pbf "$FILTERED_PATH" --region "${{ matrix.region }}" --skip-filter --skip-existing
       - name: Build indoor plans (${{ matrix.region }})
-        run: node collectors/build-indoor.mjs --pbf "$PBF_PATH" --region "${{ matrix.region }}" --skip-existing
+        run: node collectors/build-indoor.mjs --pbf "$FILTERED_PATH" --region "${{ matrix.region }}" --skip-filter --skip-existing
       - name: Upload to R2 (orbis-assets/data/airports)
         run: |
           if [ -d public/data/airports ]; then

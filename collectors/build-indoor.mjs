@@ -37,6 +37,7 @@ function parseArgs(argv) {
     else if (a === '--offset') args.offset = Number(argv[++i]);
     else if (a === '--skip-existing') args.skipExisting = true;
     else if (a === '--icao') args.icao = String(argv[++i]).toUpperCase();
+    else if (a === '--skip-filter') args.skipFilter = true;
   }
   return args;
 }
@@ -170,9 +171,12 @@ async function main() {
 
   mkdirSync(fileURLToPath(OUT_DIR), { recursive: true });
 
-  console.log(`Filtering PBF for indoor/building:part (${airports.length} airports in region) ...`);
-  const filteredPbf = `${tmpDir}/filtered-${regionName || 'local'}.osm.pbf`;
-  run('osmium', ['tags-filter', pbfPath, '-o', filteredPbf, '--overwrite', 'nwr/indoor', 'nwr/building:part']);
+  let filteredPbf = pbfPath;
+  if (!args.skipFilter) {
+    console.log(`Filtering PBF for indoor/building:part (${airports.length} airports in region) ...`);
+    filteredPbf = `${tmpDir}/filtered-${regionName || 'local'}.osm.pbf`;
+    run('osmium', ['tags-filter', pbfPath, '-o', filteredPbf, '--overwrite', 'nwr/indoor', 'nwr/building:part']);
+  }
 
   let done = 0, skipped = 0, failed = 0;
   for (const a of airports) {
