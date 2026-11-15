@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: malte9799/orbis
+          repository: Orbismap/orbis
           ref: ${{ env.ORBIS_REF }}
           path: orbis
           sparse-checkout: |
