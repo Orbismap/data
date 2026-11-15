@@ -64,12 +64,6 @@ jobs:
       - name: Prepare airports.json for indoor
         if: ${{ env.TASK == 'indoor' }}
         run: |
-          echo "=== orbis checkout contents ==="
-          ls -la orbis 2>&1 | tail -30
-          echo "=== orbis/public ==="
-          ls -la orbis/public 2>&1 | tail -30
-          echo "=== orbis/public/data ==="
-          ls -la orbis/public/data 2>&1 | tail -30
           mkdir -p public/data
           cp orbis/public/data/airports.json public/data/airports.json
       - name: Collect manual
