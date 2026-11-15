@@ -1,5 +1,5 @@
-// Plan helper for indoor workflow: reads state files and prints JSON array of regions to refresh.
-// Usage: node collectors/indoor-plan.mjs <stateDir> [region|all]
+// Plan helper for airports workflow: reads state files and prints JSON array of regions to refresh.
+// Usage: node collectors/airports-plan.mjs <stateDir> [region|all]
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -49,5 +49,3 @@ function main() {
 }
 
 main();
-EOF
-node --check /Users/malte/Develpoment/Websites/orbis-data/collectors/indoor-plan.mjs && echo "OK" && node /Users/malte/Develpoment/Websites/orbis-data/collectors/indoor-plan.mjs /tmp 2>&1 | tail -3

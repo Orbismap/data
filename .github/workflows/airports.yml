@@ -1,8 +1,8 @@
-name: Indoor (airport plans)
+name: Airports (plans + indoor)
 
-# OSM Indoor-Daten (Simple Indoor Tagging) für Flughäfen als JSON-Dateien im Bucket orbis-assets/data/indoor/.
+# Flughafen-Pläne + Indoor-Daten als JSON-Dateien im Bucket orbis-assets/data/airports/.
 # Läuft wöchentlich (älteste fällige Region) oder manuell (region/all_regions). Pro Region ein Matrix-Job.
-# Collector: collectors/build-indoor-osmium.mjs (osmium + Geofabrik-Extracts).
+# Collectors: build-airportplan-osmium.mjs + build-indoor-osmium.mjs (osmium + Geofabrik-Extracts).
 
 on:
   workflow_dispatch:
@@ -55,11 +55,11 @@ jobs:
             exit 1
           fi
           mkdir -p state
-          aws s3 sync "s3://orbis-assets/data/indoor/.state" state --exclude "*" --include "*.json" \
+          aws s3 sync "s3://orbis-assets/data/airports/.state" state --exclude "*" --include "*.json" \
             --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no state yet - all regions count as due'
           ARG="$REGION"
           if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
-          REGIONS=$(node collectors/indoor-plan.mjs state "$ARG")
+          REGIONS=$(node collectors/airports-plan.mjs state "$ARG")
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
           echo "regions to refresh: $REGIONS"
 
@@ -82,22 +82,24 @@ jobs:
         with:
           node-version: 22
       - run: sudo apt-get install -y --no-install-recommends osmium-tool
+      - name: Build airport plans (${{ matrix.region }})
+        run: node collectors/build-airportplan-osmium.mjs --region "${{ matrix.region }}" --skip-existing
       - name: Build indoor plans (${{ matrix.region }})
-        run: node collectors/build-indoor-osmium.mjs --region "${{ matrix.region }}" --skip-existing
-      - name: Upload to R2 (orbis-assets/data/indoor)
+        run: node collectors/build-indoor.mjs --region "${{ matrix.region }}" --skip-existing
+      - name: Upload to R2 (orbis-assets/data/airports)
         run: |
-          if [ -d public/data/indoor ]; then
+          if [ -d public/data/airports ]; then
             mkdir -p tmp-upload/data
-            cp -R public/data/indoor tmp-upload/data/indoor
+            cp -R public/data/airports tmp-upload/data/airports
             collectors/upload.sh tmp-upload orbis-assets "public, max-age=2592000, stale-while-revalidate=604800"
             rm -rf tmp-upload
           else
-            echo "No public/data/indoor directory, nothing to upload."
+            echo "No public/data/airports directory, nothing to upload."
           fi
       - name: Write state file
         run: |
           mkdir -p state-out/.state
-          COUNT=$(ls public/data/indoor/*.json 2>/dev/null | wc -l)
+          COUNT=$(ls public/data/airports/*.json 2>/dev/null | wc -l)
           echo "{\"region\":\"${{ matrix.region }}\",\"built\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"count\":$COUNT}" > "state-out/.state/${{ matrix.region }}.json"
-          aws s3 cp "state-out/.state/${{ matrix.region }}.json" "s3://orbis-assets/data/indoor/.state/${{ matrix.region }}.json" \
+          aws s3 cp "state-out/.state/${{ matrix.region }}.json" "s3://orbis-assets/data/airports/.state/${{ matrix.region }}.json" \
             --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
