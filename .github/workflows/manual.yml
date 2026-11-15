@@ -97,7 +97,10 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
           if [ -d public/data/indoor ]; then
-            collectors/upload.sh public/data/indoor orbis-assets "public, max-age=2592000, stale-while-revalidate=604800"
+            mkdir -p tmp-upload/data
+            cp -R public/data/indoor tmp-upload/data/indoor
+            collectors/upload.sh tmp-upload orbis-assets "public, max-age=2592000, stale-while-revalidate=604800"
+            rm -rf tmp-upload
           else
             echo "No public/data/indoor directory, nothing to upload."
           fi
