@@ -1,0 +1,103 @@
+name: Indoor (airport plans)
+
+# OSM Indoor-Daten (Simple Indoor Tagging) für Flughäfen als JSON-Dateien im Bucket orbis-assets/data/indoor/.
+# Läuft wöchentlich (älteste fällige Region) oder manuell (region/all_regions). Pro Region ein Matrix-Job.
+# Collector: collectors/build-indoor-osmium.mjs (osmium + Geofabrik-Extracts).
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region erzwingen (europe, russia, asia, north-america, central-america, south-america, africa, oceania) - leer: älteste fällige'
+        type: string
+        default: ''
+      all_regions:
+        description: 'Alle Regionen in einem Lauf bauen (z. B. beim ersten Lauf)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 4 * * 1'  # wöchentlich Montag 04:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: indoor
+  cancel-in-progress: false
+
+env:
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_DEFAULT_REGION: auto
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      regions: ${{ steps.plan.outputs.regions }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      REGION: ${{ github.event.inputs.region || '' }}
+      ALL_REGIONS: ${{ github.event.inputs.all_regions || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Plan
+        id: plan
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo '::error::R2 credentials missing'
+            exit 1
+          fi
+          mkdir -p state
+          aws s3 sync "s3://orbis-assets/data/indoor/.state" state --exclude "*" --include "*.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no state yet - all regions count as due'
+          ARG="$REGION"
+          if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
+          REGIONS=$(node collectors/indoor-plan.mjs state "$ARG")
+          echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          echo "regions to refresh: $REGIONS"
+
+  extract:
+    needs: plan
+    if: ${{ needs.plan.outputs.regions != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.regions) }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get install -y --no-install-recommends osmium-tool
+      - name: Build indoor plans (${{ matrix.region }})
+        run: node collectors/build-indoor-osmium.mjs --region "${{ matrix.region }}" --skip-existing
+      - name: Upload to R2 (orbis-assets/data/indoor)
+        run: |
+          if [ -d public/data/indoor ]; then
+            mkdir -p tmp-upload/data
+            cp -R public/data/indoor tmp-upload/data/indoor
+            collectors/upload.sh tmp-upload orbis-assets "public, max-age=2592000, stale-while-revalidate=604800"
+            rm -rf tmp-upload
+          else
+            echo "No public/data/indoor directory, nothing to upload."
+          fi
+      - name: Write state file
+        run: |
+          mkdir -p state-out/.state
+          COUNT=$(ls public/data/indoor/*.json 2>/dev/null | wc -l)
+          echo "{\"region\":\"${{ matrix.region }}\",\"built\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"count\":$COUNT}" > "state-out/.state/${{ matrix.region }}.json"
+          aws s3 cp "state-out/.state/${{ matrix.region }}.json" "s3://orbis-assets/data/indoor/.state/${{ matrix.region }}.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
