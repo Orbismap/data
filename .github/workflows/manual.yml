@@ -52,8 +52,7 @@ jobs:
           path: orbis
           sparse-checkout: |
             src
-            public/data/games
-            public/data/airports.json
+            public/data
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -65,6 +64,11 @@ jobs:
       - name: Prepare airports.json for indoor
         if: ${{ env.TASK == 'indoor' }}
         run: |
+          if [ ! -f orbis/public/data/airports.json ]; then
+            echo "orbis/public/data/airports.json not found; listing orbis/public/data"
+            ls -la orbis/public/data | tail -40
+            exit 1
+          fi
           mkdir -p public/data
           cp orbis/public/data/airports.json public/data/airports.json
       - name: Collect manual
