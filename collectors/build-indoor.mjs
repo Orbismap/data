@@ -105,10 +105,14 @@ function indoorPlanFromGeoJson(features) {
       out.push({ type: 'Feature', id, geometry: { type: 'LineString', coordinates: coords }, properties: { ...base } });
       continue;
     }
-    if (f.geometry.type === 'Polygon') {
-      const coords = f.geometry.coordinates[0];
-      if (!coords || coords.length < 4) continue;
-      out.push({ type: 'Feature', id, geometry: { type: 'Polygon', coordinates: [coords] }, properties: { ...base } });
+    if (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon') {
+      const rings = f.geometry.type === 'MultiPolygon'
+        ? f.geometry.coordinates.map((poly) => poly[0])
+        : [f.geometry.coordinates[0]];
+      for (const coords of rings) {
+        if (!coords || coords.length < 4) continue;
+        out.push({ type: 'Feature', id, geometry: { type: 'Polygon', coordinates: [coords] }, properties: { ...base } });
+      }
       continue;
     }
   }
