@@ -49,6 +49,8 @@ const HOSTS = {
   'realtime.hsl.fi': 15,
   'gtfs.ovapi.nl': 25,
   'gtfsrt.api.translink.com.au': 15,
+  // Energy-Charts (Fraunhofer ISE, CC BY 4.0): power mix, prices; sends CORS only for its own site, data in 15-minute steps
+  'api.energy-charts.info': 300,
 };
 // the worldwide OpenSky overview is large and changes slowly
 const ttlFor = (url) => (url.hostname === 'opensky-network.org' && !url.searchParams.has('lamin') ? 90 : HOSTS[url.hostname]);
