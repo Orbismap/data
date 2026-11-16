@@ -1,6 +1,6 @@
 name: OSM tiles
 
-# OSM-Punktdaten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen) als PMTiles, eine Datei je Datensatz weltweit
+# OSM-Punktdaten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume) als PMTiles, eine Datei je Datensatz weltweit
 # (collectors/osm-tiles.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`) in drei Schritten:
 #   plan     liest src/<region>/info.json aus dem Bucket orbis-osm und wählt die Region, die älter als 30 Tage ist (die
 #            älteste; die Regionen verteilen sich so über den Monat) - oder alle 8 bei `all_regions`
@@ -8,6 +8,9 @@ name: OSM tiles
 #            src/<region>/<set>.geojsonl (+ info.json) nach orbis-osm
 #   build    lädt src/ aller Regionen, baut mit tippecanoe <set>.pmtiles (+ heat/cctv.json, meta.json) und lädt sie hoch;
 #            löscht danach die alten JSON-Kacheln im Bucket
+# Zwischendateien: die der Bäume (trees.geojsonl.gz, ~5 GB roh) liegen NICHT in R2 (Free Tier 10 GB), sondern als Assets
+# `<region>-trees.geojsonl.gz` im GitHub-Release `osm-src` dieses Repos (öffentlich, kostenlos). Die übrigen Sätze bleiben
+# vorerst in orbis-osm/src.
 # Ziel: Bucket orbis-osm (R2-Zugangsdaten sind Pflicht: die Jobs tauschen die Daten über den Bucket aus).
 # Erster Lauf (leerer Bucket): `all_regions` aktivieren, dann werden alle Regionen in einem Lauf gebaut (Europa dauert ~3 h,
 # die Regionen laufen parallel in der Matrix, jede in ihrem eigenen Job mit 6-h-Limit).
@@ -78,6 +81,8 @@ jobs:
     if: ${{ needs.plan.outputs.regions != '[]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      contents: write # release osm-src (tree intermediates)
     strategy:
       fail-fast: false
       matrix:
@@ -94,11 +99,22 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends osmium-tool
       - name: Extract ${{ matrix.region }}
         run: node collectors/osm-tiles.mjs extract out "${{ matrix.region }}"
+      - name: Upload tree intermediate to the GitHub release osm-src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # before info.json goes to R2 (below): a failed upload then does not count as refreshed
+          gh release view osm-src >/dev/null 2>&1 \
+            || gh release create osm-src --prerelease --title "OSM build intermediates" \
+                 --notes "Intermediates of the osm-tiles workflow (gzipped GeoJSON lines per region). Data © OpenStreetMap contributors (ODbL)." \
+            || gh release view osm-src >/dev/null   # another matrix job created it first
+          cp "out/src/${{ matrix.region }}/trees.geojsonl.gz" "out/${{ matrix.region }}-trees.geojsonl.gz"
+          gh release upload osm-src "out/${{ matrix.region }}-trees.geojsonl.gz" --clobber
       - name: Upload intermediates to R2 (orbis-osm/src)
         run: |
           ls -la "out/src/${{ matrix.region }}"
           # info.json last: it is what `plan` looks at, so a failed upload does not count as refreshed
-          aws s3 sync "out/src/${{ matrix.region }}" "s3://orbis-osm/src/${{ matrix.region }}/" --delete --exclude info.json \
+          aws s3 sync "out/src/${{ matrix.region }}" "s3://orbis-osm/src/${{ matrix.region }}/" --delete --exclude info.json --exclude "*.gz" \
             --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
           aws s3 cp "out/src/${{ matrix.region }}/info.json" "s3://orbis-osm/src/${{ matrix.region }}/info.json" \
             --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
@@ -138,6 +154,19 @@ jobs:
           aws s3 sync s3://orbis-osm/src work/src --exclude "*" --include "*/*.geojsonl" --include "*/info.json" \
             --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors
           du -sh work/src/*
+      - name: Tree intermediates (GitHub release osm-src)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p work/trees
+          gh release download osm-src --pattern '*-trees.geojsonl.gz' --dir work/trees --clobber || echo '::notice::no tree intermediates in the release yet'
+          for f in work/trees/*-trees.geojsonl.gz; do
+            [ -e "$f" ] || continue
+            r=$(basename "$f" -trees.geojsonl.gz)
+            mkdir -p "work/src/$r"
+            mv "$f" "work/src/$r/trees.geojsonl.gz"
+          done
+          du -sh work/src/*/trees.geojsonl.gz 2>/dev/null || true
       - name: Build PMTiles
         run: |
           tippecanoe --version

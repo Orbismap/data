@@ -1,7 +1,8 @@
 // OpenStreetMap point data for Orbis as PMTiles: one file per data set for the whole world in the bucket orbis-osm
 // (<set>.pmtiles, layer name = set). Sets: cctv (surveillance cameras without ALPR/webcams), blitzer (speed and
 // red-light cameras), alpr (licence plate readers), webcam (webcams with a link), wind (single wind turbines),
-// resource (mine shafts, adits, wells, quarry/mine/oil/gas/refinery points).
+// resource (mine shafts, adits, wells, quarry/mine/oil/gas/refinery points), trees (natural=tree nodes for the 3D view,
+// zoom 15 only, see SET_ZOOM).
 // Only nodes are available when streaming (-R): ways and areas with these tags are not included.
 //
 // Three steps (run by .github/workflows/osm-tiles.yml, bucket orbis-osm):
@@ -11,7 +12,7 @@
 //   node collectors/osm-tiles.mjs extract <outDir> <region> [--url <pbf-url>]
 //                                                              streams the Geofabrik extract through `osmium tags-filter -R` (nothing
 //                                                              big is stored) and writes intermediates, one per set:
-//                                                              <outDir>/src/<region>/<set>.geojsonl (newline-delimited GeoJSON points)
+//                                                              <outDir>/src/<region>/<set>.geojsonl (newline-delimited GeoJSON points; GZ_SETS: <set>.geojsonl.gz)
 //                                                              <outDir>/src/<region>/info.json  (build date, counts, format)
 //                                                              --url builds from another .osm.pbf (local test with a tiny extract)
 //   node collectors/osm-tiles.mjs build <srcDir> <distDir>     builds <distDir>/<set>.pmtiles with tippecanoe from the intermediates
@@ -26,6 +27,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSyn
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
+import { createGzip } from 'node:zlib';
 
 export const REGIONS = {
   europe: 'europe',
@@ -40,12 +42,14 @@ export const REGIONS = {
 const MAX_AGE_DAYS = 30;
 const CELL = 100; // heatmap cells per degree (0.01° ≈ 1 km)
 /** bump when the file layout changes: older regions count as stale and are rebuilt */
-export const FORMAT = 5;
+export const FORMAT = 6;
 /** point data sets – the client reads them in src/api/osmtiles.ts */
-export const SETS = ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'];
+export const SETS = ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'trees'];
 /** pmtiles zoom range: single points down to z14 (no points dropped at max zoom unless a tile is huge), thinned out below */
 const MIN_ZOOM = 0;
 const MAX_ZOOM = 14;
+/** sets with their own zoom range [min, max] (trees: single trees for the 3D view, z15 only: the map overzooms it, z16 would store every tree twice) */
+export const SET_ZOOM = { trees: [15, 15] };
 /**
  * Sets the viewer draws from zoom 0 (cameras): below LOW_ZOOM_END their tiles carry a second, attribute-free layer
  * `<set>_lo` instead of the full records. Every point stays visible: points that fall into the same cell of a
@@ -56,6 +60,13 @@ export const LOW_SETS = ['cctv', 'blitzer', 'alpr', 'webcam'];
 export const LOW_ZOOM_END = 6; // first zoom of the full layer; the `_lo` layer covers 0 .. LOW_ZOOM_END - 1
 export const LOW_GRID = 1024;
 
+/** sets whose intermediates are gzipped (<set>.geojsonl.gz; trees is ~18x bigger than all other sets together, R2 free tier is 10 GB) */
+export const GZ_SETS = ['trees'];
+/** sets whose build may fail without stopping the rest (the other sets and meta.json are still published) */
+export const OPTIONAL_SETS = ['trees'];
+/** file name of a set's intermediate in <src>/<region>/ */
+export const srcFile = (set) => `${set}.geojsonl${GZ_SETS.includes(set) ? '.gz' : ''}`;
+
 /** record fields after [lon, lat] per set (= property names of the GeoJSON features) */
 export const FIELDS = {
   cctv: ['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id'],
@@ -64,11 +75,12 @@ export const FIELDS = {
   webcam: ['dir', 'name', 'operator', 'panning', 'link', 'id'],
   wind: ['name', 'operator', 'manufacturer', 'model', 'output', 'id'],
   resource: ['name', 'kind', 'words', 'resource', 'operator', 'id'],
+  trees: ['species', 'genus', 'height', 'circumference', 'leaf_type', 'leaf_cycle', 'id'],
 };
 /** default of a field (left out of the file): direction -1, flags 0, everything else '' (id is always present) */
 export const fieldDefault = (f) => (f === 'dir' ? -1 : f === 'guard' || f === 'flock' || f === 'panning' ? 0 : '');
 
-/** a record [lon, lat, …FIELDS[set]] as GeoJSON point feature */
+/** a record [lon, lat, …FIELDS[set]] as GeoJSON point feature (numbers stay numbers; '' = not tagged = left out) */
 export function toFeature(set, rec) {
   const props = {};
   FIELDS[set].forEach((f, i) => {
@@ -183,6 +195,27 @@ export function resourceRecord({ id, x, y, tags: t }) {
   return [r5(x), r5(y), t.name ?? '', kind, words, t.resource ?? '', t.operator ?? '', Number(id)];
 }
 
+/** OSM number in metres ("12", "12.5", "12 m", "12,5") → rounded number, or '' when missing/unusable (0 < v <= max) */
+export function metres(raw, max, digits) {
+  if (raw === undefined) return '';
+  const m = /^\s*(\d+(?:[.,]\d+)?)\s*(?:m)?\s*$/i.exec(raw);
+  if (!m) return '';
+  const v = parseFloat(m[1].replace(',', '.'));
+  if (!(v > 0 && v <= max)) return '';
+  const k = 10 ** digits;
+  return Math.round(v * k) / k;
+}
+
+const LEAF_TYPES = ['broadleaved', 'needleleaved', 'mixed', 'leafless'];
+const LEAF_CYCLES = ['deciduous', 'evergreen', 'semi_deciduous', 'semi_evergreen'];
+/** a value of a fixed vocabulary, else '' (junk values would only bloat the tiles) */
+const oneOf = (v, list) => (v !== undefined && list.includes(v.trim().toLowerCase()) ? v.trim().toLowerCase() : '');
+
+/** tree record: [lon, lat, species, genus, height m, circumference m, leaf_type, leaf_cycle, OSM node id]; missing values stay '' (left out, the renderer picks defaults) */
+export function treeRecord({ id, x, y, tags: t }) {
+  return [r5(x), r5(y), t.species ?? '', t.genus ?? '', metres(t.height, 150, 1), metres(t.circumference, 30, 2), oneOf(t.leaf_type, LEAF_TYPES), oneOf(t.leaf_cycle, LEAF_CYCLES), Number(id)];
+}
+
 const RESOURCE_MAN_MADE = ['petroleum_well', 'pumpjack', 'mineshaft', 'adit'];
 const RESOURCE_INDUSTRIAL = ['mine', 'oil', 'gas', 'refinery'];
 
@@ -195,13 +228,17 @@ function classify(p) {
   if (link) out.push(['webcam', webcamRecord(p, link)]);
   if (t.power === 'generator' && t['generator:source'] === 'wind') out.push(['wind', windRecord(p)]);
   if (RESOURCE_MAN_MADE.includes(t.man_made) || RESOURCE_INDUSTRIAL.includes(t.industrial) || t.landuse === 'quarry') out.push(['resource', resourceRecord(p)]);
+  if (t.natural === 'tree') out.push(['trees', treeRecord(p)]);
   return out;
 }
 
 
 /** appends lines to a file with backpressure */
 function lineWriter(path) {
-  const ws = createWriteStream(path);
+  const file = createWriteStream(path);
+  const gz = path.endsWith('.gz') ? createGzip({ level: 6 }) : null;
+  if (gz) gz.pipe(file);
+  const ws = gz ?? file;
   let buf = [];
   let size = 0;
   const flush = async () => {
@@ -220,7 +257,7 @@ function lineWriter(path) {
     async close() {
       await flush();
       ws.end();
-      await once(ws, 'finish');
+      await once(file, 'finish');
     },
   };
 }
@@ -230,12 +267,12 @@ async function extract(region, outDir, url) {
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const src = url ?? `https://download.geofabrik.de/${REGIONS[region]}-latest.osm.pbf`;
-  const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry r/type=enforcement`;
+  const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry n/natural=tree r/type=enforcement`;
   const input = /^https?:/.test(src) ? `curl -sSfL -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`;
   const proc = spawn('bash', ['-c', `set -o pipefail; ${input} | osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - - ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
   console.log(`${region}: streaming ${src}`);
   const t0 = Date.now();
-  const out = Object.fromEntries(SETS.filter((s) => s !== 'blitzer').map((s) => [s, lineWriter(join(dir, `${s}.geojsonl`))]));
+  const out = Object.fromEntries(SETS.filter((s) => s !== 'blitzer').map((s) => [s, lineWriter(join(dir, srcFile(s)))]));
   const counts = Object.fromEntries(SETS.map((s) => [s, 0]));
   /** speed cameras by node id; enforcement relations (they come after all nodes) refine their kind */
   const speed = new Map();
@@ -366,13 +403,14 @@ async function build(srcDir, distDir) {
   }
   console.log(`building from ${used.join(', ')}`);
   for (const set of SETS) {
-    const files = used.map((r) => join(srcDir, r, `${set}.geojsonl`)).filter((f) => existsSync(f) && statSync(f).size > 0);
+    const files = used.map((r) => join(srcDir, r, srcFile(set))).filter((f) => existsSync(f) && statSync(f).size > 0);
     const target = join(distDir, `${set}.pmtiles`);
     if (!files.length) {
       console.log(`${set}: no data – skipped`);
       continue;
     }
     // -r1: no thinning by rate; -b 0: no buffer (points would be duplicated into the neighbour tiles); --drop-densest-as-needed only where a tile gets too big (dense low zooms), -M/-O keep z14 complete
+    const [zMin, zMax] = SET_ZOOM[set] ?? [MIN_ZOOM, MAX_ZOOM];
     const common = ['--force', '-n', set, '-N', `OpenStreetMap ${set} points`, '-r1', '-b', '0', '--read-parallel', '-q', '-A', '© OpenStreetMap contributors (ODbL)'];
     if (LOW_SETS.includes(set)) {
       // Camera sets: z0..LOW_ZOOM_END-1 only one bare point per grid cell (layer <set>_lo, lowZoomPoints), nothing dropped;
@@ -384,7 +422,14 @@ async function build(srcDir, distDir) {
       await run('tile-join', ['-o', target, '--force', '-pk', '-q', '-n', set, '-N', `OpenStreetMap ${set} points`, '-A', '© OpenStreetMap contributors (ODbL)', `${lo}.pmtiles`, `${join(distDir, `${set}-hi`)}.pmtiles`]);
       for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${join(distDir, `${set}-hi`)}.pmtiles`]) rmSync(f, { force: true });
     } else {
-      await run('tippecanoe', ['-o', target, '-l', set, '-Z', String(MIN_ZOOM), '-z', String(MAX_ZOOM), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...files]);
+      try {
+        await run('tippecanoe', ['-o', target, '-l', set, '-Z', String(zMin), '-z', String(zMax), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...files]);
+      } catch (e) {
+        if (!OPTIONAL_SETS.includes(set)) throw e;
+        console.error(`${set}: build failed (${e.message}) – skipped, the previous file stays in the bucket`);
+        rmSync(target, { force: true });
+        continue;
+      }
     }
     meta.sets[set] = { ...meta.sets[set], bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0) };
     console.log(`${set}: ${meta.sets[set].bytes} bytes`);

@@ -177,7 +177,7 @@ Die Schiffe vor Norwegen (Kystverket-Landstationen, Equinor-Offshore-Stationen, 
 
 ### OSM-Punktdaten (PMTiles)
 
-`collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen sechs Datensätze, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Datensatz, Zoom 0–14, nur Knoten, ODbL):
+`collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen sieben Datensätze, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Datensatz, Zoom 0–14, nur `trees` Zoom 15, nur Knoten, ODbL):
 
 | Datei | Inhalt |
 |---|---|
@@ -187,8 +187,9 @@ Die Schiffe vor Norwegen (Kystverket-Landstationen, Equinor-Offshore-Stationen, 
 | `webcam.pmtiles` | Webcams mit Link |
 | `wind.pmtiles` | einzelne Windräder |
 | `resource.pmtiles` | Schächte, Stollen, Bohrlöcher, Steinbrüche, Bergwerke, Öl/Gas/Raffinerien |
+| `trees.pmtiles` | einzelne Bäume (`natural=tree`, nur Knoten; `tree_row` und Flächen fehlen) für die 3D-Ansicht, nur Zoom 15 (darüber überzoomt die Karte), Felder `species`, `genus`, `height` (m), `circumference` (m), `leaf_type`, `leaf_cycle`, `id`; fehlende Werte werden weggelassen, Standardwerte wählt der Renderer |
 | `heat/cctv.json` | Dichte-Zellen `[lon, lat, anzahl]` (0,01°) der ganzen Welt für die CCTV-Heatmap |
-| `meta.json` | `format: 5`, je Region Bauzeit und Zähler (`regions`), je Datensatz Größe/Anzahl (`sets`) |
+| `meta.json` | `format: 6`, je Region Bauzeit und Zähler (`regions`), je Datensatz Größe/Anzahl (`sets`) |
 | `LICENSE.txt` | ODbL-Hinweis |
 | `src/<region>/<set>.geojsonl`, `src/<region>/info.json` | Zwischendateien (Newline-delimited GeoJSON, je Region), Eingabe des Builds; `info.json` = Bauzeit der Region |
 
