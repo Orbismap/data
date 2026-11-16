@@ -268,7 +268,7 @@ async function extract(region, outDir, url) {
   mkdirSync(dir, { recursive: true });
   const src = url ?? `https://download.geofabrik.de/${REGIONS[region]}-latest.osm.pbf`;
   const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry n/natural=tree r/type=enforcement`;
-  const input = /^https?:/.test(src) ? `curl -sSfL -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`;
+  const input = /^https?:/.test(src) ? `curl -sSfL --connect-timeout 30 --speed-limit 200000 --speed-time 180 -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`;
   const proc = spawn('bash', ['-c', `set -o pipefail; ${input} | osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - - ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
   console.log(`${region}: streaming ${src}`);
   const t0 = Date.now();
@@ -309,6 +309,19 @@ async function extract(region, outDir, url) {
   for (const w of Object.values(out)) await w.close();
   console.log(`${region}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')} (${Math.round((Date.now() - t0) / 1000)} s)`);
   return counts;
+}
+
+/** a streamed download cannot resume: on any failure (connect error, stall, broken stream) start the region over, up to 3 times */
+async function extractWithRetry(region, outDir, url, attempts = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await extract(region, outDir, url);
+    } catch (e) {
+      if (i >= attempts) throw e;
+      console.error(`${region}: attempt ${i}/${attempts} failed (${e.message}) – starting over in 30 s`);
+      await new Promise((r) => setTimeout(r, 30_000));
+    }
+  }
 }
 
 /** which regions to refresh: `all`, the given one, or the stalest one that is due */
@@ -453,7 +466,7 @@ async function main() {
     const [outDir, region, flag, url] = args;
     if (!outDir || !region) throw new Error('usage: osm-tiles extract <outDir> <region> [--url <pbf>]');
     if (!REGIONS[region] && flag !== '--url') throw new Error(`unknown region ${region}`);
-    const counts = await extract(region, outDir, flag === '--url' ? url : undefined);
+    const counts = await extractWithRetry(region, outDir, flag === '--url' ? url : undefined);
     if (!url && counts.cctv < 50) throw new Error(`${region}: only ${counts.cctv} cameras – keeping previous data`);
     writeFileSync(join(outDir, 'src', region, 'info.json'), JSON.stringify({ at: Date.now(), counts, format: FORMAT }));
   } else if (cmd === 'build') {
