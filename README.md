@@ -116,6 +116,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
 | `manual.yml` (nur *Run workflow*, kein Dispatch) | – | `fetch-data.ts --group manual` | `orbis-data` | 30 min |
 | `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `build`; eine Region ≥ 30 Tage alt, oder alle mit `all_regions`) | `orbis-osm` | je Job 350 min |
+| `karte.yml` (`karte`) | manuell, bei Änderung von `collectors/karte/`, monatlich (nur `overlay`) | `collectors/karte/build-data.sh` (siehe [Karten-Daten](#karten-daten-orbis-karte)) | `orbis-osm` unter `karte/` | je Job 240 min |
 | `wetter.yml` (`wetter`) | 03:20, 09:20, 15:20, 21:20 | `wetter-icon.py` (+ `wetter-dem.py` auf Wunsch) | `orbis-wetter` (`vars.R2_BUCKET_WETTER`) | 60 min |
 
 Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine Dateien; scheitert er, bleiben die alten Objekte stehen, denn der Upload löscht nie):
@@ -209,6 +210,28 @@ node collectors/osm-tiles.mjs plan ./osm-test [region|all]             # welche 
 ```
 
 Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mit einem Server ausliefern, der Range-Anfragen und CORS (`Access-Control-Allow-Origin`, `Range` erlaubt, `ETag` freigegeben) beherrscht.
+
+### Karten-Daten (Orbis Karte)
+
+Vier PMTiles für die Grundkarte „Orbis Karte“ der App (OpenFreeMap-Kacheln + eigene Ebenen), alle in `orbis-osm/karte/`; die App findet sie über `VITE_OSM_BASE` (`src/map/basemaps/karte-data.ts`, im Dev lokal aus `public/data/karte/` oder `VITE_KARTE_DATA_BASE`).
+
+| Datei | Inhalt | Quelle | Bauzeit |
+|---|---|---|---|
+| `labels.pmtiles` | Städte (Zoom 0–2), Gebirge, Wüsten, Regionen | Natural Earth (gemeinfrei) | Sekunden |
+| `landcover-vec.pmtiles` | grobe Landbedeckung bis Zoom 6 | Natural Earth `NE2_HR_LC` | ~2 min |
+| `landcover-hi.pmtiles` | feine Landbedeckung (~1 km) bis Zoom 8, ~190 MB | Copernicus CGLS-LC100 v3.0.1 (CC BY 4.0), 1,7 GB Download | ~40–60 min |
+| `overlay.pmtiles` | Deponien (bisher nur Hessen) | Geofabrik-Auszug (ODbL) | Minuten |
+
+`karte.yml`: `plan` → ein `build`-Job je Datei (parallel, tippecanoe und Quellen gecacht, Prüfung auf PMTiles-Header) → `upload` (nur wenn alle Builds grün sind; `collectors/upload.sh`, ohne `--delete`). Bei *Run workflow* lässt sich eine Datei wählen und `upload` abschalten (Ergebnis bleibt 14 Tage als Artefakt). Es werden keine neuen Secrets gebraucht (`R2_*` wie bei `osm-tiles`).
+
+**Lokal** (`brew install tippecanoe osmium-tool`, `pip install -r collectors/karte/requirements.txt`):
+
+```bash
+collectors/karte/build-data.sh all            # oder labels | landcover-vec | landcover-hi | overlay -> dist/karte-out/karte/
+WORK=$HOME/osm collectors/karte/build-data.sh labels   # vorhandene Quellen unter ~/osm wiederverwenden
+```
+
+Für die lokale App: Dateien nach `public/data/karte/` der App kopieren.
 
 ### Benötigte Secrets und Variablen (Repository `Orbismap/data`, *Settings → Secrets and variables → Actions*)
 

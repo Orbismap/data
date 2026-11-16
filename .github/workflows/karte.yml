@@ -1,0 +1,145 @@
+name: Karte
+
+# PMTiles der Grundkarte "Orbis Karte" (collectors/karte/build-data.sh): Labels, grobe und feine Landbedeckung, Deponien.
+# Ziel: orbis-osm unter karte/ (die App liest sie über VITE_OSM_BASE). Die Quellen ändern sich kaum, deshalb kein Dispatch der
+# Uhr: manuell, bei Änderung der Build-Skripte und monatlich für das OSM-Overlay.
+#   Natural Earth (gemeinfrei), Copernicus CGLS-LC100 v3.0.1 (CC BY 4.0), OpenStreetMap-Auszug von Geofabrik (ODbL).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Welche Datei bauen'
+        type: choice
+        default: all
+        options: [all, labels, landcover-vec, landcover-hi, overlay]
+      upload:
+        description: 'Nach orbis-osm hochladen (aus = nur bauen, Ergebnis als Artefakt)'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - collectors/karte/**
+      - .github/workflows/karte.yml
+  schedule:
+    - cron: '17 3 1 * *'   # monatlich: nur overlay
+
+permissions:
+  contents: read
+
+concurrency:
+  group: karte
+  cancel-in-progress: false
+
+env:
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_DEFAULT_REGION: auto
+  TIPPECANOE_VERSION: '2.79.0'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.t.outputs.targets }}
+    steps:
+      - id: t
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT: ${{ github.event.inputs.target }}
+        run: |
+          case "$EVENT:$INPUT" in
+            schedule:*) list='["overlay"]' ;;
+            workflow_dispatch:all|push:*) list='["labels","landcover-vec","landcover-hi","overlay"]' ;;
+            *) list="[\"$INPUT\"]" ;;
+          esac
+          echo "targets=$list" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: osmium
+        if: matrix.target == 'overlay'
+        run: sudo apt-get install -y --no-install-recommends osmium-tool
+
+      - name: tippecanoe (cache)
+        id: tippecanoe
+        uses: actions/cache@v4
+        with:
+          path: ~/tippecanoe
+          key: tippecanoe-${{ env.TIPPECANOE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: tippecanoe (build felt/tippecanoe ${{ env.TIPPECANOE_VERSION }})
+        if: steps.tippecanoe.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev zlib1g-dev
+          git clone --depth 1 --branch "$TIPPECANOE_VERSION" https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src
+          make -C /tmp/tippecanoe-src -j"$(nproc)"
+          make -C /tmp/tippecanoe-src install PREFIX="$HOME/tippecanoe"
+      - run: echo "$HOME/tippecanoe/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v5
+        if: startsWith(matrix.target, 'landcover')
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: collectors/karte/requirements.txt
+      - name: Python packages
+        if: startsWith(matrix.target, 'landcover')
+        run: pip install -r collectors/karte/requirements.txt
+
+      # heruntergeladene Quellen (LC100 1,7 GB): gecacht, Schlüssel = Quellenliste im Skript
+      - uses: actions/cache@v4
+        with:
+          path: dist/karte-src
+          key: karte-src-${{ matrix.target }}-${{ hashFiles('collectors/karte/build-data.sh') }}
+
+      - name: Build ${{ matrix.target }}
+        run: collectors/karte/build-data.sh "${{ matrix.target }}"
+
+      - name: Check
+        run: |
+          f="dist/karte-out/karte/${{ matrix.target }}.pmtiles"
+          [ "$(head -c 7 "$f")" = "PMTiles" ] || { echo "::error::not a PMTiles file: $f"; exit 1; }
+          [ "$(wc -c < "$f")" -gt 10000 ] || { echo "::error::suspiciously small: $f"; exit 1; }
+          ls -l "$f"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: karte-${{ matrix.target }}
+          path: dist/karte-out/karte/${{ matrix.target }}.pmtiles
+          retention-days: 14
+          if-no-files-found: error
+
+  upload:
+    needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.upload == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: karte-*
+          path: dist/karte-up/karte
+          merge-multiple: true
+      - name: Upload to orbis-osm/karte/
+        run: |
+          ls -l dist/karte-up/karte
+          collectors/upload.sh dist/karte-up orbis-osm "public, max-age=86400"

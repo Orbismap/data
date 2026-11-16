@@ -1,0 +1,5 @@
+numpy
+Pillow
+rasterio
+shapely>=2
+scipy
