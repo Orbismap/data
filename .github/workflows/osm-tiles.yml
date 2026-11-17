@@ -8,9 +8,13 @@ name: OSM tiles
 #            src/<region>/<set>.geojsonl (+ info.json) nach orbis-osm
 #   build    lädt src/ aller Regionen, baut mit tippecanoe <set>.pmtiles (+ heat/cctv.json, meta.json) und lädt sie hoch;
 #            löscht danach die alten JSON-Kacheln im Bucket
-# Zwischendateien: die der Bäume (trees.geojsonl.gz, ~5 GB roh) liegen NICHT in R2 (Free Tier 10 GB), sondern als Assets
-# `<region>-trees.geojsonl.gz` im GitHub-Release `osm-src` dieses Repos (öffentlich, kostenlos). Die übrigen Sätze bleiben
-# vorerst in orbis-osm/src.
+# Zwischendateien: die der Bäume (trees.geojsonl.gz, ~5 GB roh) und der Baumlinien (tree_lines.geojsonl.gz, Baumreihen und
+# Hecken, die zweite Ebene `tree_lines` von trees.pmtiles) liegen NICHT in R2 (Free Tier 10 GB), sondern als Assets
+# `<region>-trees.geojsonl.gz` / `<region>-tree_lines.geojsonl.gz` im GitHub-Release `osm-src` dieses Repos (öffentlich,
+# kostenlos). Die übrigen Sätze bleiben vorerst in orbis-osm/src.
+# Die Baumlinien brauchen im extract einen zweiten Durchlauf über den Auszug (Knoten der Wege nachladen), das kostet je
+# Region etwa einen weiteren Download + Filterlauf; scheitert er, bleiben die Punkte erhalten und die Region gilt als
+# veraltet (info.json `linesOk: false`), `plan` nimmt sie beim nächsten Lauf sofort wieder.
 # Ziel: Bucket orbis-osm (R2-Zugangsdaten sind Pflicht: die Jobs tauschen die Daten über den Bucket aus).
 # Erster Lauf (leerer Bucket): `all_regions` aktivieren, dann werden alle Regionen in einem Lauf gebaut (Europa dauert ~3 h,
 # die Regionen laufen parallel in der Matrix, jede in ihrem eigenen Job mit 6-h-Limit).
@@ -110,6 +114,11 @@ jobs:
             || gh release view osm-src >/dev/null   # another matrix job created it first
           cp "out/src/${{ matrix.region }}/trees.geojsonl.gz" "out/${{ matrix.region }}-trees.geojsonl.gz"
           gh release upload osm-src "out/${{ matrix.region }}-trees.geojsonl.gz" --clobber
+          # tree rows and hedges (missing when the line pass failed: then the previous asset stays and info.json says linesOk: false)
+          if [ -s "out/src/${{ matrix.region }}/tree_lines.geojsonl.gz" ]; then
+            cp "out/src/${{ matrix.region }}/tree_lines.geojsonl.gz" "out/${{ matrix.region }}-tree_lines.geojsonl.gz"
+            gh release upload osm-src "out/${{ matrix.region }}-tree_lines.geojsonl.gz" --clobber
+          fi
       - name: Upload intermediates to R2 (orbis-osm/src)
         run: |
           ls -la "out/src/${{ matrix.region }}"
@@ -159,14 +168,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p work/trees
-          gh release download osm-src --pattern '*-trees.geojsonl.gz' --dir work/trees --clobber || echo '::notice::no tree intermediates in the release yet'
-          for f in work/trees/*-trees.geojsonl.gz; do
+          gh release download osm-src --pattern '*-trees.geojsonl.gz' --pattern '*-tree_lines.geojsonl.gz' --dir work/trees --clobber || echo '::notice::no tree intermediates in the release yet'
+          for f in work/trees/*-trees.geojsonl.gz work/trees/*-tree_lines.geojsonl.gz; do
             [ -e "$f" ] || continue
-            r=$(basename "$f" -trees.geojsonl.gz)
+            b=$(basename "$f")
+            case "$b" in
+              *-tree_lines.geojsonl.gz) r=${b%-tree_lines.geojsonl.gz}; n=tree_lines.geojsonl.gz ;;
+              *) r=${b%-trees.geojsonl.gz}; n=trees.geojsonl.gz ;;
+            esac
             mkdir -p "work/src/$r"
-            mv "$f" "work/src/$r/trees.geojsonl.gz"
+            mv "$f" "work/src/$r/$n"
           done
-          du -sh work/src/*/trees.geojsonl.gz 2>/dev/null || true
+          du -sh work/src/*/trees.geojsonl.gz work/src/*/tree_lines.geojsonl.gz 2>/dev/null || true
       - name: Build PMTiles
         run: |
           tippecanoe --version
