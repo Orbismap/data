@@ -122,7 +122,8 @@ jobs:
 
   upload:
     needs: build
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.upload == 'true' }}
+    # also when single builds failed: the finished files are still published (the others keep their old version in the bucket)
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && (github.event_name != 'workflow_dispatch' || github.event.inputs.upload == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
