@@ -2,8 +2,11 @@
 // (<set>.pmtiles, layer name = set). Sets: cctv (surveillance cameras without ALPR/webcams), blitzer (speed and
 // red-light cameras), alpr (licence plate readers), webcam (webcams with a link), wind (single wind turbines),
 // resource (mine shafts, adits, wells, quarry/mine/oil/gas/refinery points), trees (natural=tree nodes for the 3D view,
-// zoom 15 only, see SET_ZOOM).
-// Only nodes are available when streaming (-R): ways and areas with these tags are not included.
+// zoom 15 only, see SET_ZOOM; the same file carries a second layer `tree_lines` with the ways natural=tree_row and
+// barrier=hedge as lines, see treeLineRecord).
+// Only nodes are available when streaming (-R): ways and areas with the other tags are not included. The tree lines
+// need geometry and therefore a second streamed pass over the extract (extractLines): the first pass keeps the ways
+// (their node refs), the second one fetches just those nodes (`osmium getid`), osmium builds the lines (`export`).
 //
 // Three steps (run by .github/workflows/osm-tiles.yml, bucket orbis-osm):
 //   node collectors/osm-tiles.mjs plan <dir> [region|all]      prints the JSON list of regions to refresh: <dir>/src/<region>/info.json
@@ -13,6 +16,7 @@
 //                                                              streams the Geofabrik extract through `osmium tags-filter -R` (nothing
 //                                                              big is stored) and writes intermediates, one per set:
 //                                                              <outDir>/src/<region>/<set>.geojsonl (newline-delimited GeoJSON points; GZ_SETS: <set>.geojsonl.gz)
+//                                                              <outDir>/src/<region>/tree_lines.geojsonl.gz (GeoJSON lines of the `tree_lines` layer)
 //                                                              <outDir>/src/<region>/info.json  (build date, counts, format)
 //                                                              --url builds from another .osm.pbf (local test with a tiny extract)
 //   node collectors/osm-tiles.mjs build <srcDir> <distDir>     builds <distDir>/<set>.pmtiles with tippecanoe from the intermediates
@@ -42,7 +46,7 @@ export const REGIONS = {
 const MAX_AGE_DAYS = 30;
 const CELL = 100; // heatmap cells per degree (0.01° ≈ 1 km)
 /** bump when the file layout changes: older regions count as stale and are rebuilt */
-export const FORMAT = 6;
+export const FORMAT = 7;
 /** point data sets – the client reads them in src/api/osmtiles.ts */
 export const SETS = ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'trees'];
 /** pmtiles zoom range: single points down to z14 (no points dropped at max zoom unless a tile is huge), thinned out below */
@@ -50,6 +54,10 @@ const MIN_ZOOM = 0;
 const MAX_ZOOM = 14;
 /** sets with their own zoom range [min, max] (trees: single trees for the 3D view, z15 only: the map overzooms it, z16 would store every tree twice) */
 export const SET_ZOOM = { trees: [15, 15] };
+/** second layer of trees.pmtiles: tree rows and hedges as lines; its intermediate is <region>/tree_lines.geojsonl.gz (not a set of its own: it goes into the build of `trees`) */
+export const LINES = { set: 'trees', layer: 'tree_lines', file: 'tree_lines.geojsonl.gz' };
+/** Douglas-Peucker tolerance of the lines (m) */
+export const LINE_TOLERANCE = 1;
 /**
  * Sets the viewer draws from zoom 0 (cameras): below LOW_ZOOM_END their tiles carry a second, attribute-free layer
  * `<set>_lo` instead of the full records. Every point stays visible: points that fall into the same cell of a
@@ -75,9 +83,11 @@ export const FIELDS = {
   webcam: ['dir', 'name', 'operator', 'panning', 'link', 'id'],
   wind: ['name', 'operator', 'manufacturer', 'model', 'output', 'id'],
   resource: ['name', 'kind', 'words', 'resource', 'operator', 'id'],
-  trees: ['species', 'genus', 'height', 'circumference', 'leaf_type', 'leaf_cycle', 'id'],
+  trees: ['species', 'height', 'circumference', 'leaf_type', 'leaf_cycle'], // no id (position is enough to find a tree in OSM), no genus (the app derives it from species)
 };
-/** default of a field (left out of the file): direction -1, flags 0, everything else '' (id is always present) */
+/** property names of a tree_lines feature (after the geometry) */
+export const LINE_FIELDS = ['kind', 'species', 'height', 'leaf_type', 'leaf_cycle'];
+/** default of a field (left out of the file): direction -1, flags 0, everything else '' (id, where a set has one, is always present) */
 export const fieldDefault = (f) => (f === 'dir' ? -1 : f === 'guard' || f === 'flock' || f === 'panning' ? 0 : '');
 
 /** a record [lon, lat, …FIELDS[set]] as GeoJSON point feature (numbers stay numbers; '' = not tagged = left out) */
@@ -211,9 +221,83 @@ const LEAF_CYCLES = ['deciduous', 'evergreen', 'semi_deciduous', 'semi_evergreen
 /** a value of a fixed vocabulary, else '' (junk values would only bloat the tiles) */
 const oneOf = (v, list) => (v !== undefined && list.includes(v.trim().toLowerCase()) ? v.trim().toLowerCase() : '');
 
-/** tree record: [lon, lat, species, genus, height m, circumference m, leaf_type, leaf_cycle, OSM node id]; missing values stay '' (left out, the renderer picks defaults) */
-export function treeRecord({ id, x, y, tags: t }) {
-  return [r5(x), r5(y), t.species ?? '', t.genus ?? '', metres(t.height, 150, 1), metres(t.circumference, 30, 2), oneOf(t.leaf_type, LEAF_TYPES), oneOf(t.leaf_cycle, LEAF_CYCLES), Number(id)];
+/** tree record: [lon, lat, species, height m, circumference m, leaf_type, leaf_cycle]; missing values stay '' (left out, the renderer picks defaults) */
+export function treeRecord({ x, y, tags: t }) {
+  return [r5(x), r5(y), t.species ?? '', metres(t.height, 150, 1), metres(t.circumference, 30, 2), oneOf(t.leaf_type, LEAF_TYPES), oneOf(t.leaf_cycle, LEAF_CYCLES)];
+}
+
+/** metres between two lon/lat points, planar approximation around latitude `lat0` (good enough for 1 m tolerances) */
+const planar = (c, lat0) => [c[0] * 111320 * Math.cos((lat0 * Math.PI) / 180), c[1] * 110574];
+
+/** Douglas-Peucker: the points of `coords` ([lon, lat][]) that remain with tolerance `tol` metres; first and last always stay (so closed rings stay closed) */
+export function simplify(coords, tol = LINE_TOLERANCE) {
+  if (coords.length < 3) return coords;
+  const lat0 = coords[0][1];
+  const pts = coords.map((c) => planar(c, lat0));
+  const keep = new Uint8Array(pts.length);
+  keep[0] = keep[pts.length - 1] = 1;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    const [ax, ay] = pts[a], [bx, by] = pts[b];
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    let worst = -1, wi = -1;
+    for (let i = a + 1; i < b; i++) {
+      const [px, py] = pts[i];
+      let d;
+      if (len2 === 0) d = Math.hypot(px - ax, py - ay);
+      else {
+        const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+        d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      }
+      if (d > worst) { worst = d; wi = i; }
+    }
+    if (worst > tol) {
+      keep[wi] = 1;
+      stack.push([a, wi], [wi, b]);
+    }
+  }
+  return coords.filter((_, i) => keep[i]);
+}
+
+/**
+ * Line record of a way: [coords [lon, lat][], kind 'row'|'hedge', species (rows only), height m, leaf_type, leaf_cycle], or null
+ * (neither tree_row nor hedge, or fewer than 2 distinct points left). Coordinates: ≤ 5 decimals, simplified to ~1 m.
+ */
+export function treeLineRecord(tags, coords) {
+  const kind = tags.natural === 'tree_row' ? 'row' : tags.barrier === 'hedge' ? 'hedge' : null;
+  if (!kind) return null;
+  const pts = [];
+  for (const [x, y] of coords) {
+    const p = [r5(x), r5(y)];
+    const last = pts[pts.length - 1];
+    if (!last || last[0] !== p[0] || last[1] !== p[1]) pts.push(p);
+  }
+  const line = simplify(pts);
+  if (line.length < 2) return null;
+  return [line, kind, kind === 'row' ? tags.species ?? '' : '', metres(tags.height, kind === 'row' ? 150 : 30, 1), oneOf(tags.leaf_type, LEAF_TYPES), oneOf(tags.leaf_cycle, LEAF_CYCLES)];
+}
+
+/** a line record as GeoJSON LineString feature (empty values left out; `kind` is always there) */
+export function lineFeature(rec) {
+  const props = {};
+  LINE_FIELDS.forEach((f, i) => {
+    const v = rec[i + 1];
+    if (f === 'kind' || v !== '') props[f] = v;
+  });
+  return { type: 'Feature', geometry: { type: 'LineString', coordinates: rec[0] }, properties: props };
+}
+
+/** One OPL line of a way → { id, tags, refs: node id strings } or null */
+export function parseWay(line) {
+  if (line.charCodeAt(0) !== 119 /* w */) return null;
+  let id, raw = '', nds = '';
+  for (const f of line.split(' ')) {
+    if (f[0] === 'w' && id === undefined) id = f.slice(1);
+    else if (f[0] === 'T') raw = f.slice(1);
+    else if (f[0] === 'N') nds = f.slice(1);
+  }
+  return { id, tags: parseTags(raw), refs: nds ? nds.split(',').map((n) => n.slice(1)) : [] };
 }
 
 const RESOURCE_MAN_MADE = ['petroleum_well', 'pumpjack', 'mineshaft', 'adit'];
@@ -262,21 +346,87 @@ function lineWriter(path) {
   };
 }
 
+/** shell command that writes the .osm.pbf of `src` (URL or local file) to stdout */
+const pbfInput = (src) => (/^https?:/.test(src) ? `curl -sSfL --connect-timeout 30 --speed-limit 200000 --speed-time 180 -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`);
+
+/** runs a shell pipeline, resolves when it exits 0 */
+function sh(cmd) {
+  return new Promise((res, rej) => {
+    const p = spawn('bash', ['-c', `set -o pipefail; ${cmd}`], { stdio: ['ignore', 'inherit', 'inherit'] });
+    p.on('error', rej);
+    p.on('close', (c) => (c === 0 ? res() : rej(new Error(`pipeline failed (exit ${c}): ${cmd.slice(0, 120)}`))));
+  });
+}
+
+/**
+ * Tree lines (natural=tree_row, barrier=hedge) as <dir>/tree_lines.geojsonl.gz. Input: `waysFile`, the OPL lines of the
+ * ways from the first pass (tags + node refs). Second streamed pass over the extract: only the nodes those ways use
+ * (`osmium getid`, ids from the ways), then osmium merges nodes + ways in a temp dir and exports them as linestrings
+ * (closed ways stay lines). Returns the number of lines written.
+ */
+async function extractLines(dir, src, waysFile) {
+  const tmp = join(dir, 'lines-tmp');
+  mkdirSync(tmp, { recursive: true });
+  const idsFile = join(tmp, 'node-ids.txt');
+  const ids = lineWriter(idsFile);
+  let ways = 0;
+  for await (const line of createInterface({ input: createReadStream(waysFile) })) {
+    const w = parseWay(line);
+    if (!w) continue;
+    ways++;
+    for (const r of w.refs) await ids.write(`n${r}`);
+  }
+  await ids.close();
+  if (!ways) {
+    rmSync(tmp, { recursive: true, force: true });
+    await new Promise((res) => createWriteStream(join(dir, LINES.file)).end(res)); // empty gz-less placeholder is skipped by build (size 0)
+    return 0;
+  }
+  const nodes = join(tmp, 'nodes.osm.pbf'), waysPbf = join(tmp, 'ways.osm.pbf'), merged = join(tmp, 'merged.osm.pbf'), located = join(tmp, 'lines.geojsonseq');
+  // pass 2 over the extract: only the used nodes (getid without -r reads the stream once; ids in a bitmap)
+  await sh(`${pbfInput(src)} | osmium getid --overwrite -F pbf -f pbf -o "${nodes}" -i "${idsFile}" -`);
+  await sh(`osmium cat --overwrite --input-format=opl -f pbf -o "${waysPbf}" "${waysFile}" && osmium merge --overwrite -o "${merged}" "${nodes}" "${waysPbf}"`);
+  rmSync(nodes, { force: true });
+  rmSync(waysPbf, { force: true });
+  await sh(`osmium export --overwrite -i sparse_file_array,"${join(tmp, 'locations.idx')}" --geometry-types=linestring -f geojsonseq -x print_record_separator=false -o "${located}" "${merged}"`);
+  rmSync(merged, { force: true });
+  const out = lineWriter(join(dir, LINES.file));
+  let n = 0;
+  for await (const line of createInterface({ input: createReadStream(located), crlfDelay: Infinity })) {
+    if (!line) continue;
+    const f = JSON.parse(line);
+    if (f.geometry?.type !== 'LineString') continue;
+    const rec = treeLineRecord(f.properties ?? {}, f.geometry.coordinates);
+    if (!rec) continue;
+    await out.write(JSON.stringify(lineFeature(rec)));
+    n++;
+  }
+  await out.close();
+  rmSync(tmp, { recursive: true, force: true });
+  return n;
+}
+
 async function extract(region, outDir, url) {
   const dir = join(outDir, 'src', region);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const src = url ?? `https://download.geofabrik.de/${REGIONS[region]}-latest.osm.pbf`;
-  const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry n/natural=tree r/type=enforcement`;
-  const input = /^https?:/.test(src) ? `curl -sSfL --connect-timeout 30 --speed-limit 200000 --speed-time 180 -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" "${src}"` : `cat "${src}"`;
+  const filter = `n/man_made=surveillance n/highway=speed_camera n/surveillance:type=ALPR n/webcam n/contact:webcam n/generator:source=wind n/man_made=${RESOURCE_MAN_MADE.join(',')} n/industrial=${RESOURCE_INDUSTRIAL.join(',')} n/landuse=quarry n/natural=tree w/natural=tree_row w/barrier=hedge r/type=enforcement`;
+  const input = pbfInput(src);
   const proc = spawn('bash', ['-c', `set -o pipefail; ${input} | osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - - ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
   console.log(`${region}: streaming ${src}`);
   const t0 = Date.now();
   const out = Object.fromEntries(SETS.filter((s) => s !== 'blitzer').map((s) => [s, lineWriter(join(dir, srcFile(s)))]));
-  const counts = Object.fromEntries(SETS.map((s) => [s, 0]));
+  const counts = Object.fromEntries([...SETS, LINES.layer].map((s) => [s, 0]));
+  const waysFile = join(dir, 'ways.opl'); // tree rows and hedges (OPL), input of extractLines
+  const ways = createWriteStream(waysFile);
   /** speed cameras by node id; enforcement relations (they come after all nodes) refine their kind */
   const speed = new Map();
   for await (const line of createInterface({ input: proc.stdout })) {
+    if (line.charCodeAt(0) === 119 /* w */) {
+      if (!ways.write(`${line}\n`)) await once(ways, 'drain');
+      continue;
+    }
     const rel = line.charCodeAt(0) === 114 ? parseEnforcement(line) : null;
     if (rel) {
       // positions of relations are not available when streaming (-R), so use their device nodes:
@@ -307,8 +457,21 @@ async function extract(region, outDir, url) {
   counts.blitzer = speed.size;
   await bl.close();
   for (const w of Object.values(out)) await w.close();
+  ways.end();
+  await once(ways, 'finish');
+  // lines: second pass, may fail without losing the points (info.linesOk = false makes `plan` pick the region again at once)
+  let linesOk = true;
+  try {
+    counts[LINES.layer] = await extractLines(dir, src, waysFile);
+  } catch (e) {
+    linesOk = false;
+    console.error(`${region}: tree lines failed (${e.message}) – points are kept, the lines of this region are missing until the next run`);
+    rmSync(join(dir, LINES.file), { force: true });
+    rmSync(join(dir, 'lines-tmp'), { recursive: true, force: true });
+  }
+  rmSync(waysFile, { force: true });
   console.log(`${region}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')} (${Math.round((Date.now() - t0) / 1000)} s)`);
-  return counts;
+  return { counts, linesOk };
 }
 
 /** a streamed download cannot resume: on any failure (connect error, stall, broken stream) start the region over, up to 3 times */
@@ -331,7 +494,7 @@ export function planRegions(infos, arg, now = Date.now()) {
     if (!REGIONS[arg]) throw new Error(`unknown region ${arg}`);
     return [arg];
   }
-  const age = (r) => (infos[r]?.format === FORMAT ? now - infos[r].at : Infinity);
+  const age = (r) => (infos[r]?.format === FORMAT && infos[r].linesOk !== false ? now - infos[r].at : Infinity);
   const due = Object.keys(REGIONS).filter((r) => age(r) > MAX_AGE_DAYS * 864e5).sort((a, b) => age(b) - age(a));
   return due.slice(0, 1);
 }
@@ -417,6 +580,7 @@ async function build(srcDir, distDir) {
   console.log(`building from ${used.join(', ')}`);
   for (const set of SETS) {
     const files = used.map((r) => join(srcDir, r, srcFile(set))).filter((f) => existsSync(f) && statSync(f).size > 0);
+    const lineFiles = set === LINES.set ? used.map((r) => join(srcDir, r, LINES.file)).filter((f) => existsSync(f) && statSync(f).size > 0) : [];
     const target = join(distDir, `${set}.pmtiles`);
     if (!files.length) {
       console.log(`${set}: no data – skipped`);
@@ -436,7 +600,9 @@ async function build(srcDir, distDir) {
       for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${join(distDir, `${set}-hi`)}.pmtiles`]) rmSync(f, { force: true });
     } else {
       try {
-        await run('tippecanoe', ['-o', target, '-l', set, '-Z', String(zMin), '-z', String(zMax), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...files]);
+        // trees: two layers in one file, -L name:file per input (points `trees`, lines `tree_lines`, both only at the set's zoom)
+        const inputs = lineFiles.length ? [...files.map((f) => ['-L', `${set}:${f}`]), ...lineFiles.map((f) => ['-L', `${LINES.layer}:${f}`])].flat() : ['-l', set, ...files];
+        await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), '--drop-densest-as-needed', '-M', '1000000', '-O', '250000', ...common, ...inputs]);
       } catch (e) {
         if (!OPTIONAL_SETS.includes(set)) throw e;
         console.error(`${set}: build failed (${e.message}) – skipped, the previous file stays in the bucket`);
@@ -444,7 +610,7 @@ async function build(srcDir, distDir) {
         continue;
       }
     }
-    meta.sets[set] = { ...meta.sets[set], bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0) };
+    meta.sets[set] = { ...meta.sets[set], bytes: statSync(target).size, features: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[set] ?? 0), 0), ...(set === LINES.set ? { lines: used.reduce((a, r) => a + (meta.regions[r]?.counts?.[LINES.layer] ?? 0), 0) } : {}) };
     console.log(`${set}: ${meta.sets[set].bytes} bytes`);
   }
   const cctv = used.map((r) => join(srcDir, r, 'cctv.geojsonl')).filter((f) => existsSync(f));
@@ -466,9 +632,9 @@ async function main() {
     const [outDir, region, flag, url] = args;
     if (!outDir || !region) throw new Error('usage: osm-tiles extract <outDir> <region> [--url <pbf>]');
     if (!REGIONS[region] && flag !== '--url') throw new Error(`unknown region ${region}`);
-    const counts = await extractWithRetry(region, outDir, flag === '--url' ? url : undefined);
+    const { counts, linesOk } = await extractWithRetry(region, outDir, flag === '--url' ? url : undefined);
     if (!url && counts.cctv < 50) throw new Error(`${region}: only ${counts.cctv} cameras – keeping previous data`);
-    writeFileSync(join(outDir, 'src', region, 'info.json'), JSON.stringify({ at: Date.now(), counts, format: FORMAT }));
+    writeFileSync(join(outDir, 'src', region, 'info.json'), JSON.stringify({ at: Date.now(), counts, format: FORMAT, ...(linesOk ? {} : { linesOk: false }) }));
   } else if (cmd === 'build') {
     const [srcDir, distDir] = args;
     if (!srcDir || !distDir) throw new Error('usage: osm-tiles build <srcDir> <distDir>');
