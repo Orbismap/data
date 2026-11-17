@@ -134,6 +134,21 @@ await task('safecast', 'live-15m', async () => {
   write('safecast.json', await json('https://tt.safecast.org/devices'));
 });
 
+/**
+ * Electricity mix and day-ahead price per country (Energy-Charts, CC BY 4.0) for the Orbis layer `strommix`. The API sends CORS
+ * only for its own site and answers bursts with 429, so one polite run here replaces 25 requests per visitor. Runs hourly
+ * (one call at a time, about 60 calls): the run takes minutes and the API is rate limited. Logic and format:
+ * collectors/energy-charts.mjs -> energy/mix.json.
+ */
+await task('energy-charts', 'live-1h', async () => {
+  const { collectEnergy } = await import('./energy-charts.mjs');
+  const doc = (await collectEnergy((url: string) => json(url, 30000))) as { countries: Record<string, unknown>; time: number };
+  const n = Object.keys(doc.countries).length;
+  if (n < 10) throw new Error(`only ${n} countries – keeping previous data`);
+  write('energy/mix.json', doc);
+  console.log(`  ${n} countries, newest step ${new Date(doc.time).toISOString()}`);
+});
+
 await task('radiation', 'live-15m', async () => {
   // the STUK/Health Canada helpers only exist in orbis main once the radiation PR is merged – older checkouts: skip softly
   const earth = (await import('@orbis/api/earth')) as Record<string, unknown>;
