@@ -25,7 +25,21 @@ mkdir -p "$WORK/naturalearth" "$WORK/landcover" "$WORK/geofabrik" "$OUT"
 log() { printf '\n== %s\n' "$*" >&2; }
 fetch() { # url ziel   (lädt fort, wiederholt bei Fehlern, schreibt erst am Ende an den Zielnamen)
   [ -s "$2" ] && return 0
-  curl -fL --retry 5 --retry-delay 10 --retry-all-errors -C - -o "$2.part" "$1" && mv "$2.part" "$2"
+  curl -fL -A "Orbis-data/1.0 (+https://github.com/malte9799/orbis)" --retry 5 --retry-delay 10 --retry-all-errors -C - -o "$2.part" "$1" && mv "$2.part" "$2"
+}
+fetch_chunks() { # url ziel   (Geofabrik weist vom Runner aus vollständige GET-Anfragen oft ab, Bereichsanfragen klappen: in 50-MB-Stücken laden)
+  [ -s "$2" ] && return 0
+  local ua="Orbis-data/1.0 (+https://github.com/malte9799/orbis)" url size from=0 to
+  url="$(curl -sS -L -A "$ua" --retry 5 --retry-all-errors -o /dev/null -w '%{url_effective}' -r 0-0 "$1")"
+  size="$(curl -sS -L -A "$ua" --retry 5 --retry-all-errors -r 0-0 -D - -o /dev/null "$url" | tr -d '\r' | awk -F/ 'tolower($1) ~ /^content-range/ {print $2}')"
+  [ -n "$size" ] || { echo "Dateigröße von $url unbekannt" >&2; return 1; }
+  : > "$2.part"
+  while [ "$from" -lt "$size" ]; do
+    to=$((from + 52428800 - 1)); [ "$to" -ge "$size" ] && to=$((size - 1))
+    curl -fsS -A "$ua" --retry 8 --retry-delay 10 --retry-all-errors -r "$from-$to" "$url" >> "$2.part"
+    from=$((to + 1))
+  done
+  mv "$2.part" "$2"
 }
 ne() { # Natural-Earth-Datensatz: Ordner anlegen und entpacken. ne <10m_cultural|10m_physical|10m_raster> <name>
   local dir="$WORK/naturalearth/$2"
@@ -70,7 +84,7 @@ landcover_hi() {
 overlay() {
   log "overlay (Deponien)"
   local pbf="${PBF:-$WORK/geofabrik/$(basename "$PBF_URL")}"
-  [ -n "${PBF:-}" ] || fetch "$PBF_URL" "$pbf"
+  [ -n "${PBF:-}" ] || fetch_chunks "$PBF_URL" "$pbf"
   local tmp; tmp="$(mktemp -d)"
   osmium tags-filter "$pbf" a/landuse=landfill -o "$tmp/f.osm.pbf"
   osmium export "$tmp/f.osm.pbf" -f geojsonseq --geometry-types=polygon -o "$tmp/f.geojsonseq"
