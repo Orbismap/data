@@ -5,7 +5,7 @@ name: OSM tiles
 #   plan     Geofabrik-Index (index-v1.json) -> ca. 500 Regionen (Länder/Unterregionen, je < 1,2 GB); wählt die ältesten, die älter als
 #            30 Tage sind (ein Dreißigstel aller Regionen je Lauf = rollierend), oder alle bei `all_regions` (höchstens 250 je Lauf).
 #            Alter einer Region = Upload-Zeit ihres Assets `<region>.f<FORMAT>.points.tar` im Release osm-src-points
-#   extract  Matrix-Job je 5 Regionen (nacheinander, Platte dazwischen geleert): lädt den Auszug, schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und
+#   extract  Matrix-Job je Region: lädt den Auszug, schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und
 #            lädt sie als Assets in die GitHub-Releases osm-src-points (ein tar je Region mit den sechs Punktsätzen, zuletzt: das ist
 #            der Zustand), osm-src-trees und osm-src-roofs (je Release höchstens 1000 Assets, je Asset höchstens 2 GB)
 #   merge    lädt die Regional-Stücke ALLER Regionen, führt sie je Thema mit tile-join zur Welt-Datei zusammen
@@ -55,13 +55,11 @@ jobs:
       contents: write # creates the releases osm-src-* once (the extract jobs only upload)
     outputs:
       regions: ${{ steps.plan.outputs.regions }}
-      batches: ${{ steps.plan.outputs.batches }}
       releases: ${{ steps.plan.outputs.releases }}
     env:
       REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
       ALL_REGIONS: ${{ github.event.inputs.all_regions || github.event.client_payload.all_regions || 'false' }}
       MERGE_ONLY: ${{ github.event.inputs.merge_only || 'false' }}
-      BATCH_SIZE: '5'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -93,8 +91,6 @@ jobs:
           if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
           REGIONS=$(node collectors/osm-tiles.mjs plan index.json assets.json $ARG)
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
-          # several regions per extract job (one after the other, the disk is cleaned in between): saves the runner setup and API load per region
-          echo "batches=$(echo "$REGIONS" | jq -c --argjson n "$BATCH_SIZE" '[_nwise($n) | join(" ")]')" >> "$GITHUB_OUTPUT"
           echo "regions to refresh: $REGIONS"
       # the extract jobs take the index from here instead of all asking Geofabrik for it (hundreds of parallel requests got refused)
       - uses: actions/upload-artifact@v4
@@ -108,14 +104,14 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.regions != '[]' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # a batch of several regions
+    timeout-minutes: 180
     permissions:
       contents: write # releases osm-src-*
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
-        batch: ${{ fromJSON(needs.plan.outputs.batches) }}
+        region: ${{ fromJSON(needs.plan.outputs.regions) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -126,33 +122,24 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: geofabrik-index
-      - name: Extract, build and upload the regions of this batch
+      - name: Extract ${{ matrix.region }}
+        run: |
+          node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
+      - name: Regional PMTiles
+        run: |
+          node collectors/osm-tiles.mjs regional out "${{ matrix.region }}"
+          ls -la out/upload
+      - name: Upload to the GitHub releases osm-src-<group>
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
         run: |
-          upload() {
-            # roofs and trees first, the points tar last: it is the state `plan` looks at, so a failed upload does not count as refreshed
-            for g in roofs trees points; do
-              for f in out/upload/*."$g".*; do
-                [ -e "$f" ] || continue
-                collectors/osm-release-upload.sh "$GITHUB_REPOSITORY" "$(echo "$RELEASES" | jq -r ".$g")" "$f" || return 1
-              done
+          # roofs and trees first, the points tar last: it is the state `plan` looks at, so a failed upload does not count as refreshed
+          for g in roofs trees points; do
+            for f in out/upload/*."$g".*; do
+              [ -e "$f" ] || continue
+              collectors/osm-release-upload.sh "$GITHUB_REPOSITORY" "$(echo "$RELEASES" | jq -r ".$g")" "$f"
             done
-          }
-          failed=""
-          for region in ${{ matrix.batch }}; do
-            echo "::group::$region"
-            if node collectors/osm-tiles.mjs extract out "$region" --index index.json \
-              && node collectors/osm-tiles.mjs regional out "$region" \
-              && ls -la out/upload \
-              && upload; then :; else
-              echo "::error::region $region failed"
-              failed="$failed $region"
-            fi
-            rm -rf out # the runner disk is limited: clean before the next region
-            echo "::endgroup::"
           done
-          [ -z "$failed" ] || { echo "::error::failed regions:$failed"; exit 1; }
 
   merge:
     needs: [plan, extract]
