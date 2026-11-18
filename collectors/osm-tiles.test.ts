@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, regionKey, makeOwner } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, retryAfterSeconds, backoffMs, probeSizes } from './osm-tiles.mjs';
+import sizesTable from './osm-sizes.json';
 
 describe('trees set', () => {
   it('parses metre values and drops junk', () => {
@@ -138,8 +139,15 @@ describe('plan', () => {
   it('one region or all (oldest first, at most one matrix)', () => {
     expect(planRegions([], keys, 'r07', now)).toEqual(['r07']);
     expect(() => planRegions([], keys, 'nope', now)).toThrow();
-    expect(planRegions([], keys, 'all', now)).toHaveLength(60);
-    expect(planRegions([], Array.from({ length: 400 }, (_, i) => `k${i}`), 'all', now)).toHaveLength(250);
+    expect(planRegions([], keys, 'all', now)).toHaveLength(40); // a batch; the oldest first
+    expect(planRegions([], Array.from({ length: 400 }, (_, i) => `k${i}`), 'all', now)).toHaveLength(40);
+    expect(planRegions(keys.slice(5).map((k) => asset(k, 5)), keys, 'all', now).slice(0, 5)).toEqual(['r00', 'r01', 'r02', 'r03', 'r04']);
+  });
+
+  it('a daily run stays small: about every 30 days each unit', () => {
+    expect(dailyCount(90)).toBe(3);
+    expect(dailyCount(91)).toBe(4);
+    expect(dailyCount(1)).toBe(1);
   });
 });
 
@@ -190,5 +198,113 @@ describe('regions', () => {
     expect([bb(2, 2), be(2, 2), he(2, 2)]).toEqual([true, false, false]);
     expect([bb(12, 2), he(12, 2)]).toEqual([false, true]);
     expect(bb(30, 30) || he(30, 30)).toBe(false);
+  });
+});
+
+describe('units', () => {
+  const sq = (x: number, y: number, w: number, h = w) => ({ type: 'Polygon', coordinates: [[[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]] });
+  const feat = (id: string, path: string, geometry: unknown) => ({ type: 'Feature', geometry, properties: { id, urls: { pbf: `https://download.geofabrik.de/${path}-latest.osm.pbf` } } });
+  // europe 0..30 > germany 0..20 > { brandenburg 0..10 (contains berlin 4..6), berlin, hessen 10..20 }, poland 20..30; us aggregate with a state below it
+  const index = { features: [
+    feat('europe', 'europe', sq(0, 0, 30, 10)),
+    feat('germany', 'europe/germany', sq(0, 0, 20, 10)),
+    feat('brandenburg', 'europe/germany/brandenburg', sq(0, 0, 10)),
+    feat('berlin', 'europe/germany/berlin', sq(4, 4, 2)),
+    feat('hessen', 'europe/germany/hessen', sq(10, 0, 10)),
+    feat('poland', 'europe/poland', sq(20, 0, 10)),
+    feat('dach', 'europe/dach', sq(0, 0, 25)),
+    feat('us', 'north-america/us', sq(100, 0, 30)),
+    feat('us/ohio', 'north-america/us/ohio', sq(100, 0, 10)),
+  ] };
+  const GB = 1e9;
+  const keysOf = (sizes: Record<string, number>, max = 3 * GB) => unitRegions(index, sizes, max).map((r: { key: string }) => r.key);
+
+  it('the tree is by path, collective extracts are no nodes (their children become roots)', () => {
+    const t = regionTree(index);
+    expect(t.roots.map((n: { key: string }) => n.key)).toEqual(['europe', 'north-america_us_ohio']);
+    expect(t.nodes.get('europe_germany').children.map((n: { key: string }) => n.key)).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen']);
+    expect(t.nodes.has('europe_dach')).toBe(false);
+  });
+
+  it('threshold: the biggest region that fits is one unit, bigger ones are split', () => {
+    const sizes = { europe: 30 * GB, europe_germany: 4 * GB, europe_germany_berlin: 0.1 * GB, europe_germany_brandenburg: 0.3 * GB, europe_germany_hessen: 0.4 * GB, europe_poland: 1.5 * GB };
+    expect(keysOf(sizes)).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen', 'europe_poland', 'north-america_us_ohio']);
+    expect(keysOf({ ...sizes, europe_germany: 2.9 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // fits: its children are not units
+    expect(keysOf({ ...sizes, europe_germany: 3 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // exactly the limit still fits
+    expect(keysOf({ ...sizes, europe: 3 * GB })).toEqual(['europe', 'north-america_us_ohio']);
+    expect(UNIT_MAX_BYTES).toBe(8 * GB);
+  });
+
+  it('unknown sizes: a region with children is split (safe), a leaf is a unit', () => {
+    expect(keysOf({})).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen', 'europe_poland', 'north-america_us_ohio']);
+  });
+
+  it('every point of the leaves is owned by exactly one unit, whatever the split (no gaps, no doublings)', () => {
+    const leaves = leafRegions(index);
+    const inLeaf = (x: number, y: number) => leaves.some((l: { bbox: number[] }) => x >= l.bbox[0] && x < l.bbox[2] && y >= l.bbox[1] && y < l.bbox[3]);
+    const splits = [
+      {},
+      { europe: 30 * GB, europe_germany: 4 * GB },
+      { europe: 2 * GB },
+      { europe: 30 * GB, europe_germany: 2 * GB, europe_poland: 1 * GB },
+      { europe: 30 * GB, europe_germany: 4 * GB, europe_germany_brandenburg: 1 * GB, europe_germany_hessen: 1 * GB },
+    ];
+    for (const sizes of splits) {
+      const units = unitRegions(index, sizes);
+      const owners = units.map((u: { key: string }) => makeOwner(units, u.key));
+      for (let x = 100.25; x < 130; x += 0.5) for (let y = 0.25; y < 20; y += 0.5) { // US: nothing but the state is a leaf, the aggregate us is no unit
+        expect(owners.filter((o: (x: number, y: number) => boolean) => o(x, y)).length).toBe(inLeaf(x, y) ? 1 : 0);
+      }
+      for (let x = 0.25; x < 35; x += 0.5) {
+        for (let y = 0.25; y < 12; y += 0.5) {
+          const n = owners.filter((o: (x: number, y: number) => boolean) => o(x, y)).length;
+          expect(n, `${JSON.stringify(sizes)} at ${x},${y}`).toBe(inLeaf(x, y) ? 1 : 0);
+        }
+      }
+    }
+  });
+
+  it('a seam of units keeps Berlin out of Brandenburg even when Germany is one unit', () => {
+    const units = unitRegions(index, { europe: 30 * GB, europe_germany: 2 * GB });
+    expect(units.map((u: { key: string }) => u.key)).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']);
+    const de = makeOwner(units, 'europe_germany');
+    expect(de(5, 5)).toBe(true); // Berlin lies inside germany, which has no separate unit for it
+    expect(de(25, 5)).toBe(false); // Poland
+  });
+
+  it('the committed size table: positive byte counts, keys of the index layout', () => {
+    for (const [k, v] of Object.entries(sizesTable as Record<string, number>)) {
+      expect(k).toMatch(/^[a-z0-9-]+(_[a-z0-9-]+)*$/);
+      expect(v).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('download pauses', () => {
+  it('Retry-After as seconds or date', () => {
+    expect(retryAfterSeconds('120')).toBe(120);
+    expect(retryAfterSeconds('Wed, 21 Oct 2026 07:28:00 GMT', Date.parse('2026-10-21T07:26:00Z'))).toBe(120);
+    expect(retryAfterSeconds(null)).toBeNull();
+    expect(retryAfterSeconds('soon')).toBeNull();
+  });
+
+  it('the server\'s pause is respected, else growing up to 10 minutes (plus at most 25 % jitter)', () => {
+    expect(backoffMs(1, 120)).toBeGreaterThanOrEqual(120_000);
+    expect(backoffMs(1, 120)).toBeLessThanOrEqual(150_000);
+    expect(backoffMs(1)).toBeGreaterThanOrEqual(30_000);
+    expect(backoffMs(3)).toBeGreaterThanOrEqual(120_000);
+    expect(backoffMs(20)).toBeLessThanOrEqual(750_000);
+  });
+
+  it('the size probe only asks what the selection needs and keeps known sizes', async () => {
+    const idx = { features: [
+      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'a', urls: { pbf: 'https://download.geofabrik.de/a-latest.osm.pbf' } } },
+      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'b', urls: { pbf: 'https://download.geofabrik.de/a/b-latest.osm.pbf' } } },
+      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'c', urls: { pbf: 'https://download.geofabrik.de/c-latest.osm.pbf' } } },
+    ] };
+    const asked: string[] = [];
+    const sizes = await probeSizes(idx, { a: 9e9 }, 3e9, async (url: string) => { asked.push(url); return url.includes('/c-') ? 1e9 : 2e9; }, 0);
+    expect(sizes).toEqual({ a: 9e9, a_b: 2e9, c: 1e9 });
+    expect(asked).toHaveLength(2);
   });
 });

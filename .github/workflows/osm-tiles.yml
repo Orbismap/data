@@ -2,18 +2,22 @@ name: OSM tiles
 
 # OSM-Daten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume, Dächer) als PMTiles, eine Datei je Thema weltweit
 # (collectors/osm-tiles.mjs, Themen-Registry collectors/osm-themes.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`):
-#   plan     Geofabrik-Index (index-v1.json) -> ca. 500 Regionen (Länder/Unterregionen, je < 1,2 GB); wählt die ältesten, die älter als
-#            30 Tage sind (ein Dreißigstel aller Regionen je Lauf = rollierend), oder alle bei `all_regions` (höchstens 250 je Lauf).
-#            Alter einer Region = Upload-Zeit ihres Assets `<region>.f<FORMAT>.points.tar` im Release osm-src-points
-#   extract  Matrix-Job je Region: lädt den Auszug, schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und
-#            lädt sie als Assets in die GitHub-Releases osm-src-points (ein tar je Region mit den sechs Punktsätzen, zuletzt: das ist
-#            der Zustand), osm-src-trees und osm-src-roofs (je Release höchstens 1000 Assets, je Asset höchstens 2 GB)
-#   merge    lädt die Regional-Stücke ALLER Regionen, führt sie je Thema mit tile-join zur Welt-Datei zusammen
-#            (<thema>-<datum>.pmtiles, Verweis in meta.json), lädt sie nach orbis-osm und löscht abgelöste Versionen, sobald die
-#            CDN-Cachezeit (24 h) vorbei ist. Im Dauerzustand liegt je Thema genau eine Datei im Bucket.
+#   plan     Geofabrik-Index (index-v1.json) -> ca. 150 EINHEITEN: von oben nach unten die jeweils größte Region, deren PBF höchstens 8 GB hat
+#            (Größentabelle collectors/osm-sizes.json), größere werden in ihre Unterregionen zerlegt. Wählt die ältesten Einheiten, die älter
+#            als 30 Tage sind (ein Dreißigstel aller Einheiten je Lauf = rollierend, ca. 5 am Tag), oder bei `all_regions` die 40 ältesten.
+#            Alter einer Einheit = Upload-Zeit ihres Assets `<einheit>.f<FORMAT>.points.tar` im Release osm-src-points
+#   extract  Matrix-Job je Einheit (höchstens 5 parallel): lädt den Auszug (ein Download, mit Wiederholung und Wartezeit, Retry-After wird
+#            beachtet), schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und lädt sie nacheinander als Assets
+#            in die GitHub-Releases osm-src-points (ein tar je Einheit mit den sechs Punktsätzen, zuletzt: das ist der Zustand),
+#            osm-src-trees und osm-src-roofs (je Release höchstens 1000 Assets, je Asset höchstens 2 GB)
+#   merge    prüft, dass für ALLE Einheiten ein Stück des aktuellen FORMAT vorliegt (sonst wird nichts veröffentlicht: nach einer FORMAT-Änderung
+#            bleiben die Welt-Dateien im Bucket, bis alle Einheiten neu gebaut sind), lädt die Stücke, führt sie je Thema mit tile-join zur
+#            Welt-Datei zusammen (<thema>-<datum>.pmtiles, Verweis in meta.json), lädt sie nach orbis-osm und löscht abgelöste Versionen,
+#            sobald die CDN-Cachezeit (24 h) vorbei ist. Im Dauerzustand liegt je Thema genau eine Datei im Bucket.
 # In R2 liegen nur die fertigen Welt-Dateien (+ heat/cctv.json, meta.json, LICENSE.txt), die Zwischenstücke nur in den Releases.
 # R2-Zugangsdaten sind für `merge` Pflicht; `plan` und `extract` brauchen nur das GitHub-Token.
-# Erster Lauf: `all_regions` aktivieren und so oft wiederholen, bis alle Regionen gebaut sind (je Lauf 250, die ältesten zuerst).
+# Erster Lauf / nach einer FORMAT-Änderung: `all_regions` aktivieren und so oft wiederholen, bis alle Einheiten gebaut sind (je Lauf 40, die
+# ältesten zuerst); die Läufe davor enden mit einem übersprungenen merge, erst der letzte veröffentlicht.
 
 on:
   repository_dispatch:
@@ -25,11 +29,15 @@ on:
         type: string
         default: ''
       all_regions:
-        description: 'Alle Regionen bauen (höchstens 250 je Lauf, die ältesten zuerst), z. B. beim ersten Lauf'
+        description: 'Alle Einheiten bauen (höchstens 40 je Lauf, die ältesten zuerst), z. B. beim ersten Lauf; wiederholen, bis alle gebaut sind'
         type: boolean
         default: false
       merge_only:
         description: 'Nur zusammenführen (aus den vorhandenen Regional-Stücken), keine Region bauen'
+        type: boolean
+        default: false
+      partial_merge:
+        description: 'Auch zusammenführen, wenn für manche Einheiten noch kein Stück des aktuellen FORMAT vorliegt (die Welt-Dateien haben dann Lücken)'
         type: boolean
         default: false
 
@@ -55,6 +63,7 @@ jobs:
       contents: write # creates the releases osm-src-* once (the extract jobs only upload)
     outputs:
       regions: ${{ steps.plan.outputs.regions }}
+      units: ${{ steps.plan.outputs.units }}
       releases: ${{ steps.plan.outputs.releases }}
     env:
       REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
@@ -68,6 +77,9 @@ jobs:
       - name: Plan
         id: plan
         run: |
+          curl -sSfL --retry 6 --retry-all-errors --retry-delay 20 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
+          # all units (merge checks that every one has a piece)
+          echo "units=$(node collectors/osm-tiles.mjs units index.json)" >> "$GITHUB_OUTPUT"
           if [ "$MERGE_ONLY" = "true" ]; then echo 'regions=[]' >> "$GITHUB_OUTPUT"; exit 0; fi
           # the releases exist (created here, once) and their ids go to the extract jobs: they spare themselves the lookups (API rate limit)
           ids='{}'
@@ -79,20 +91,19 @@ jobs:
             ids=$(echo "$ids" | jq -c --arg g "$g" --argjson id "$id" '. + {($g): $id}')
           done
           echo "releases=$ids" >> "$GITHUB_OUTPUT"
-          curl -sSfL --retry 6 --retry-all-errors --retry-delay 20 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
-          # Alter der Regionen: Assets des Zustand-Releases (fehlt es noch: alle Regionen gelten als fällig)
+          # age of the units: assets of the state release (missing yet: all units count as due)
           if id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null); then
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[]' | jq -s '{assets: .}' > assets.json
           else
             echo '{"assets":[]}' > assets.json
-            echo '::notice::release osm-src-points does not exist yet - all regions count as due'
+            echo '::notice::release osm-src-points does not exist yet - all units count as due'
           fi
           ARG="$REGION"
           if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
           REGIONS=$(node collectors/osm-tiles.mjs plan index.json assets.json $ARG)
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
-          echo "regions to refresh: $REGIONS"
-      # the extract jobs take the index from here instead of all asking Geofabrik for it (hundreds of parallel requests got refused)
+          echo "units to refresh: $REGIONS"
+      # the extract jobs take the index from here instead of all asking Geofabrik for it
       - uses: actions/upload-artifact@v4
         with:
           name: geofabrik-index
@@ -104,12 +115,13 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.regions != '[]' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     permissions:
       contents: write # releases osm-src-*
     strategy:
       fail-fast: false
-      max-parallel: 20
+      # few at a time: Geofabrik and the GitHub API (uploads) refuse bursts
+      max-parallel: 5
       matrix:
         region: ${{ fromJSON(needs.plan.outputs.regions) }}
     steps:
@@ -122,6 +134,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: geofabrik-index
+      - name: Free disk space (units of up to 8 GB need the room)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
       - name: Extract ${{ matrix.region }}
         run: |
           node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
@@ -133,7 +149,8 @@ jobs:
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
         run: |
-          # roofs and trees first, the points tar last: it is the state `plan` looks at, so a failed upload does not count as refreshed
+          # one after the other (osm-release-upload.sh waits on rate limits): roofs and trees first, the points tar last (it is the state
+          # `plan` looks at, so a failed upload does not count as refreshed)
           for g in roofs trees points; do
             for f in out/upload/*."$g".*; do
               [ -e "$f" ] || continue
@@ -157,38 +174,67 @@ jobs:
         with:
           node-version: 22
       - uses: ./.github/actions/tippecanoe
-      - name: Regional pieces of all regions (releases osm-src-*)
+      - name: Check coverage (a piece of the current format for every unit)
+        id: cov
+        env:
+          UNITS: ${{ needs.plan.outputs.units }}
+          PARTIAL: ${{ github.event.inputs.partial_merge || 'false' }}
         run: |
           if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo '::error::R2 credentials missing - the world files go to the bucket orbis-osm'
             exit 1
           fi
           FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          mkdir -p work
+          echo "$UNITS" > work/units.json
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null) || id=""
+          if [ -n "$id" ]; then gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[].name' > work/names.txt; else : > work/names.txt; fi
+          missing=$(jq -nr --arg f "$FORMAT" --argjson u "$UNITS" --rawfile n work/names.txt \
+            '$u - ($n | split("\n") | map(select(endswith(".f" + $f + ".points.tar")) | sub("\\.f" + $f + "\\.points\\.tar$"; ""))) | .[]')
+          total=$(echo "$UNITS" | jq length)
+          if [ -z "$missing" ]; then
+            echo "all $total units have a piece of format $FORMAT"
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+            echo 'complete=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$(echo "$missing" | wc -l | tr -d ' ') of $total units have no piece of format $FORMAT yet (first: $(echo "$missing" | head -5 | tr '\n' ' '))"
+            echo 'complete=false' >> "$GITHUB_OUTPUT"
+            if [ "$PARTIAL" = "true" ]; then echo 'skip=false' >> "$GITHUB_OUTPUT"
+            else
+              echo '::notice::merge skipped - the world files in the bucket stay as they are until all units are built (all_regions, repeat), or partial_merge'
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Regional pieces of all units (releases osm-src-*)
+        if: steps.cov.outputs.skip != 'true'
+        run: |
+          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
           mkdir -p work/assets
-          expected=0
           for g in points trees roofs; do
             id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
-            n=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[].name' | grep -c "\.f$FORMAT\." || true)
-            expected=$((expected + n))
-            gh release download "osm-src-$g" --pattern "*.f$FORMAT.*" --dir work/assets --clobber
+            for i in 1 2 3 4 5; do
+              gh release download "osm-src-$g" --pattern "*.f$FORMAT.*" --dir work/assets --clobber && break
+              echo "download of osm-src-$g failed ($i/5), waiting"; sleep $((i * 60))
+            done
           done
-          have=$(ls work/assets | wc -l)
-          echo "assets: $have of $expected"
-          [ "$have" -eq "$expected" ] || { echo '::error::not all regional pieces were downloaded'; exit 1; }
+          echo "assets: $(ls work/assets | wc -l)"
           du -sh work/assets
       - name: Merge (tile-join)
+        if: steps.cov.outputs.skip != 'true'
         run: |
           aws s3 cp s3://orbis-osm/meta.json work/prev-meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no meta.json in the bucket yet'
-          node collectors/osm-tiles.mjs merge work/assets dist --prev work/prev-meta.json --delete-list work/delete.txt
+          node collectors/osm-tiles.mjs merge work/assets dist --prev work/prev-meta.json --delete-list work/delete.txt --units work/units.json
           mkdir meta && mv dist/meta.json meta/meta.json # uploaded last
           ls -laR dist
       - name: Upload to R2 (orbis-osm)
+        if: steps.cov.outputs.skip != 'true'
         run: |
           # new versions first (new names: nothing is overwritten, the live ones keep working), meta.json (the reference) last
           collectors/upload.sh dist orbis-osm "public, max-age=86400"
           aws s3 cp meta/meta.json s3://orbis-osm/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
             --cache-control "public, max-age=3600" --content-type application/json --only-show-errors
       - name: Delete superseded versions (older than the CDN cache time)
+        if: steps.cov.outputs.skip != 'true'
         run: |
           EP="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
           [ -s work/delete.txt ] || { echo 'nothing to delete'; exit 0; }
@@ -205,7 +251,8 @@ jobs:
           "
           aws s3 cp work/manifest.json s3://orbis-osm/manifest.json --endpoint-url "$EP" \
             --cache-control "public, max-age=60, stale-while-revalidate=300" --content-type application/json --only-show-errors
-      - name: Remove regional pieces of older formats
+      - name: Remove regional pieces of older formats (only when every unit has a current piece)
+        if: steps.cov.outputs.complete == 'true' && steps.cov.outputs.skip != 'true'
         run: |
           FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
           for g in points trees roofs; do

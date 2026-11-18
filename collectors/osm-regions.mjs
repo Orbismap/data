@@ -1,5 +1,4 @@
-// Regions of the osm-tiles build: the leaves of the Geofabrik index (https://download.geofabrik.de/index-v1.json), one extract each,
-// and the OWNERSHIP rule that keeps features of overlapping extracts from being stored twice.
+// Units of the osm-tiles build: Geofabrik extracts (https://download.geofabrik.de/index-v1.json), one job each, and the OWNERSHIP rule that keeps features of overlapping extracts from being stored twice.
 //
 // Geofabrik extracts overlap: a way that crosses a border is in both neighbours (complete ways), and some extracts contain others
 // (brandenburg = "mit Berlin"). The regional pieces are merged with tile-join, which does not deduplicate. So each region only keeps
@@ -28,13 +27,63 @@ const bboxOf = (geometry) => {
 const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
 const intersects = (a, b) => a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1];
 
-/** the regions to build from the parsed index: leaves (nothing below them) that are no collective extract → [{ key, id, url, geometry, bbox }] */
+/** all leaves of the index (nothing below them) that are no collective extract → [{ key, id, url, geometry, bbox }] (the finest split; the build uses unitRegions) */
 export function leafRegions(index) {
   const feats = index.features.filter((f) => f.properties?.urls?.pbf && f.geometry);
   const parents = new Set(index.features.map((f) => f.properties?.parent).filter(Boolean));
   return feats
     .filter((f) => !parents.has(f.properties.id) && !AGGREGATES.includes(f.properties.id))
     .map((f) => ({ key: regionKey(f.properties.urls.pbf), id: f.properties.id, url: f.properties.urls.pbf, geometry: f.geometry, bbox: bboxOf(f.geometry) }));
+}
+
+/**
+ * An extract is built as ONE unit while its pbf is at most this big. What limits it is the runner disk: the pbf, the intermediates (GeoJSON
+ * lines: ~130 B per tree, ~410 B per roof building; Berlin, the densest case, 100 MB pbf -> 95 MB, a sparse continent far less), tippecanoe's
+ * temporary files for the biggest one (about 1 x) and the polygon filter files (about 0.5 x) coexist: at most ~3.5 x the pbf in dense regions
+ * (France, Germany: ~5 GB -> ~17 GB), ~1.5 x in sparse ones (Africa, Canada, Russia, South America). The runner has ~14 GB free, ~40 GB after the
+ * workflow removed the preinstalled toolchains. Release assets (2 GB each) are far smaller: trees ~6 B and roofs ~26 B per feature (Berlin),
+ * i.e. ~150 MB and ~80 MB for Germany.
+ */
+export const UNIT_MAX_BYTES = 8e9;
+
+/** path of a region on Geofabrik without `-latest.osm.pbf` (europe/germany/hessen) */
+const pathOf = (pbfUrl) => pbfUrl.replace(/^https?:\/\/download\.geofabrik\.de\//, '').replace(/-latest\.osm\.pbf$/, '');
+
+/**
+ * The tree of the index by path (europe/germany/hessen is below europe/germany; the `parent` field of the index is not used: it
+ * puts the US states below north-america). Collective extracts are no nodes, what lies below one becomes a root.
+ * → { roots, nodes: Map<key, node> }, node = { key, id, url, geometry, bbox, children }, everything sorted by key
+ */
+export function regionTree(index) {
+  const feats = index.features.filter((f) => f.properties?.urls?.pbf && f.geometry && !AGGREGATES.includes(f.properties.id));
+  const nodes = new Map(feats.map((f) => [regionKey(f.properties.urls.pbf), { key: regionKey(f.properties.urls.pbf), id: f.properties.id, url: f.properties.urls.pbf, geometry: f.geometry, bbox: bboxOf(f.geometry), children: [] }]));
+  const byPath = new Map([...nodes.values()].map((n) => [pathOf(n.url), n]));
+  const roots = [];
+  for (const n of nodes.values()) {
+    const p = pathOf(n.url);
+    const parent = p.includes('/') ? byPath.get(p.slice(0, p.lastIndexOf('/'))) : null;
+    (parent ?? { children: roots }).children.push(n);
+  }
+  const sort = (list) => list.sort((a, b) => (a.key < b.key ? -1 : 1)).forEach((n) => sort(n.children));
+  sort(roots);
+  return { roots, nodes };
+}
+
+/**
+ * The units to build: from the top down the biggest region whose pbf is at most `max` bytes (`sizes` = { key: bytes } of the committed table
+ * osm-sizes.json), a bigger one is split into its children. A region of unknown size that has children is split too (safe), a leaf is
+ * always a unit. A unit covers everything below it, so there are no gaps and no doublings (except what the index overlaps, see makeOwner).
+ * → [{ key, id, url, geometry, bbox }]
+ */
+export function unitRegions(index, sizes = {}, max = UNIT_MAX_BYTES) {
+  const out = [];
+  const walk = (n) => {
+    const size = sizes[n.key];
+    if (!n.children.length || (size !== undefined && size <= max)) out.push({ key: n.key, id: n.id, url: n.url, geometry: n.geometry, bbox: n.bbox });
+    else n.children.forEach(walk);
+  };
+  regionTree(index).roots.forEach(walk);
+  return out;
 }
 
 const CELL = 0.05; // degrees
