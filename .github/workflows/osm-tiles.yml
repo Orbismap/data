@@ -66,7 +66,7 @@ jobs:
         id: plan
         run: |
           if [ "$MERGE_ONLY" = "true" ]; then echo 'regions=[]' >> "$GITHUB_OUTPUT"; exit 0; fi
-          curl -sSfL --retry 3 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
+          curl -sSfL --retry 6 --retry-all-errors --retry-delay 20 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
           # Alter der Regionen: Assets des Zustand-Releases (fehlt es noch: alle Regionen gelten als fällig)
           if id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null); then
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[]' | jq -s '{assets: .}' > assets.json
@@ -79,6 +79,13 @@ jobs:
           REGIONS=$(node collectors/osm-tiles.mjs plan index.json assets.json $ARG)
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
           echo "regions to refresh: $REGIONS"
+      # the extract jobs take the index from here instead of all asking Geofabrik for it (hundreds of parallel requests got refused)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geofabrik-index
+          path: index.json
+          retention-days: 1
+          if-no-files-found: ignore
 
   extract:
     needs: plan
@@ -99,9 +106,11 @@ jobs:
           node-version: 22
       - run: sudo apt-get install -y --no-install-recommends osmium-tool
       - uses: ./.github/actions/tippecanoe
+      - uses: actions/download-artifact@v4
+        with:
+          name: geofabrik-index
       - name: Extract ${{ matrix.region }}
         run: |
-          curl -sSfL --retry 3 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
           node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
       - name: Regional PMTiles
         run: |

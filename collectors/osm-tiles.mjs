@@ -273,15 +273,15 @@ async function extract(key, outDir, { url, owner }) {
   return counts;
 }
 
-/** a download cannot resume: on any failure (connect error, stall, broken stream) start the region over, up to 3 times */
-async function extractWithRetry(key, outDir, opts, attempts = 3) {
+/** a download cannot resume: on any failure (connect error, stall, broken stream) start the region over, up to 5 times */
+async function extractWithRetry(key, outDir, opts, attempts = 5) {
   for (let i = 1; ; i++) {
     try {
       return await extract(key, outDir, opts);
     } catch (e) {
       if (i >= attempts) throw e;
-      console.error(`${key}: attempt ${i}/${attempts} failed (${e.message}) – starting over in 30 s`);
-      await new Promise((r) => setTimeout(r, 30_000));
+      console.error(`${key}: attempt ${i}/${attempts} failed (${e.message}) – starting over in ${i * 30} s`);
+      await new Promise((r) => setTimeout(r, i * 30_000));
     }
   }
 }
