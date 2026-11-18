@@ -220,6 +220,8 @@ async function extract(key, outDir, { url, owner }) {
   const filter = [...new Set([...points, ...lines].flatMap(([, s]) => s.filter))].join(' ');
   const proc = spawn('bash', ['-c', `set -o pipefail; osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - "${pbf}" ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
   console.log(`${key}: filtering ${pbf}`);
+  // listen before reading: a small extract can exit before the stream is drained, and a 'close' that was missed never resolves (Node then ends silently with exit 0)
+  const closed = new Promise((res) => proc.on('close', res));
   const out = Object.fromEntries(points.filter(([, s]) => !s.refine).map(([id]) => [id, lineWriter(join(dir, `${id}.geojsonl`))]));
   const ways = Object.fromEntries(lines.map(([id]) => [id, createWriteStream(join(dir, `ways-${id}.opl`))]));
   /** records of sources that are refined later (speed cameras by node id; enforcement relations come after all nodes) */
@@ -248,7 +250,7 @@ async function extract(key, outDir, { url, owner }) {
       }
     }
   }
-  const code = await new Promise((res) => proc.on('close', res));
+  const code = await closed;
   if (code !== 0) throw new Error(`${key}: download/filter failed (exit ${code})`);
   for (const [id, m] of Object.entries(deferred)) {
     const w = lineWriter(join(dir, `${id}.geojsonl`));
@@ -547,4 +549,14 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main().catch((e) => { console.error(e.message); process.exit(1); });
+if (import.meta.url === `file://${process.argv[1]}`) {
+  // a promise that never settles ends Node silently with exit 0: that must not count as success
+  let finished = false;
+  process.on('exit', (c) => {
+    if (!finished && c === 0) {
+      console.error('osm-tiles: stopped before it finished (a promise never settled)');
+      process.exitCode = 1;
+    }
+  });
+  main().then(() => { finished = true; }, (e) => { finished = true; console.error(e.message); process.exit(1); });
+}
