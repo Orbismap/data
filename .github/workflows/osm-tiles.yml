@@ -51,8 +51,11 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write # creates the releases osm-src-* once (the extract jobs only upload)
     outputs:
       regions: ${{ steps.plan.outputs.regions }}
+      releases: ${{ steps.plan.outputs.releases }}
     env:
       REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
       ALL_REGIONS: ${{ github.event.inputs.all_regions || github.event.client_payload.all_regions || 'false' }}
@@ -66,6 +69,16 @@ jobs:
         id: plan
         run: |
           if [ "$MERGE_ONLY" = "true" ]; then echo 'regions=[]' >> "$GITHUB_OUTPUT"; exit 0; fi
+          # the releases exist (created here, once) and their ids go to the extract jobs: they spare themselves the lookups (API rate limit)
+          ids='{}'
+          for g in points trees roofs; do
+            gh release view "osm-src-$g" >/dev/null 2>&1 \
+              || gh release create "osm-src-$g" --prerelease --title "OSM regional pieces: $g" \
+                   --notes "Regional PMTiles of the osm-tiles workflow (group $g), merged to the world files by its merge job. Data © OpenStreetMap contributors (ODbL)."
+            id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id)
+            ids=$(echo "$ids" | jq -c --arg g "$g" --argjson id "$id" '. + {($g): $id}')
+          done
+          echo "releases=$ids" >> "$GITHUB_OUTPUT"
           curl -sSfL --retry 6 --retry-all-errors --retry-delay 20 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
           # Alter der Regionen: Assets des Zustand-Releases (fehlt es noch: alle Regionen gelten als fällig)
           if id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null); then
@@ -117,23 +130,15 @@ jobs:
           node collectors/osm-tiles.mjs regional out "${{ matrix.region }}"
           ls -la out/upload
       - name: Upload to the GitHub releases osm-src-<group>
+        env:
+          RELEASES: ${{ needs.plan.outputs.releases }}
         run: |
-          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
           # roofs and trees first, the points tar last: it is the state `plan` looks at, so a failed upload does not count as refreshed
           for g in roofs trees points; do
             for f in out/upload/*."$g".*; do
               [ -e "$f" ] || continue
-              gh release view "osm-src-$g" >/dev/null 2>&1 \
-                || gh release create "osm-src-$g" --prerelease --title "OSM regional pieces: $g" \
-                     --notes "Regional PMTiles of the osm-tiles workflow (group $g), merged to the world files by its merge job. Data © OpenStreetMap contributors (ODbL)." \
-                || gh release view "osm-src-$g" >/dev/null   # another matrix job created it first
-              gh release upload "osm-src-$g" "$f" --clobber
+              collectors/osm-release-upload.sh "$GITHUB_REPOSITORY" "$(echo "$RELEASES" | jq -r ".$g")" "$f"
             done
-            # assets of this region from an older format are obsolete now
-            id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
-            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[] | "\(.id) \(.name)"' \
-              | awk -v r="${{ matrix.region }}" -v cur=".f$FORMAT." 'index($2, r ".f") == 1 && index($2, cur) == 0 { print $1 }' \
-              | while read -r aid; do gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$aid"; done
           done
 
   merge:
@@ -200,3 +205,12 @@ jobs:
           "
           aws s3 cp work/manifest.json s3://orbis-osm/manifest.json --endpoint-url "$EP" \
             --cache-control "public, max-age=60, stale-while-revalidate=300" --content-type application/json --only-show-errors
+      - name: Remove regional pieces of older formats
+        run: |
+          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          for g in points trees roofs; do
+            id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[] | "\(.id) \(.name)"' \
+              | awk -v cur=".f$FORMAT." 'index($2, cur) == 0 { print $1 }' \
+              | while read -r aid; do gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$aid"; done
+          done
