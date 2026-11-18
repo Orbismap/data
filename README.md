@@ -194,19 +194,6 @@ Die Schiffe vor Norwegen (Kystverket-Landstationen, Equinor-Offshore-Stationen, 
 | `meta.json` | `format: 8`, `version` (Datum), **`files`**: aktueller Dateiname je Thema (`{ "roofs": "roofs-2026-12-03.pmtiles", … }`), `sets`: je Thema `bytes`, `features` (bei `trees` zusätzlich `layers`), `regions`, `oldest`/`newest` (Bauzeit der Regionen), `retired`: abgelöste Dateien mit Zeitpunkt (werden nach 24 h gelöscht) |
 | `LICENSE.txt` | ODbL-Hinweis |
 
-**Vertrag mit der App (Ausgabe in `orbis-osm`):**
-1. `meta.json` (`max-age=3600`):
-   ```json
-   { "format": 8, "at": 1795027255346, "version": "2026-11-18",
-     "files": { "cctv": "cctv-2026-11-18.pmtiles", "blitzer": "…", "alpr": "…", "webcam": "…", "wind": "…", "resource": "…", "trees": "…", "roofs": "roofs-2026-11-18.pmtiles" },
-     "sets": { "cctv": { "bytes": 979977, "features": 6927 }, "trees": { "bytes": 4599811, "features": 496483, "layers": { "trees": 496483, "tree_lines": 45641 } }, "roofs": { "bytes": 8711512, "features": 361562 } },
-     "regions": 148, "oldest": 1795027220331, "newest": 1795027243075, "heatCells": 809,
-     "retired": [ { "file": "cctv-2026-11-17.pmtiles", "at": 1795000000000 } ] }
-   ```
-   Schlüssel je Thema = `files.<thema>` (Dateiname inkl. Datum, relativ zur Bucket-Wurzel) und `sets.<thema>`; `at` = Zeitpunkt des Merge-Laufs (ms), `version` = dessen Datum, `oldest`/`newest` = Bauzeit der ältesten/jüngsten Region (ms). Ein Thema ohne Daten fehlt in `files`. Alle Dateien einer `version` liegen vor dem `meta.json` im Bucket; `retired` darf die App ignorieren.
-2. `roofs`: Datei `files.roofs`, Layer `roofs`, nur Zoom 15 (`minzoom` = `maxzoom` = 15), Polygon/MultiPolygon, ganze Gebäude (Koordinaten dürfen über den Kachelrand hinausgehen, jedes Gebäude in genau einer Kachel). Felder (nur gesetzte, alle Text, Namen = OSM-Schlüssel): `building`, `building:part`, `height`, `building:height`, `min_height`, `building:levels`, `building:min_level`, `roof:levels`, `roof:shape`, `roof:height`, `roof:direction`, `roof:orientation`, `roof:angle`, `roof:colour`, `roof:material`, `building:colour`, `colour`, `building:material`, `material`. Jeder Eintrag hat `building` oder `building:part` und mindestens eines von `roof:shape`, `roof:height`, `roof:levels`, `roof:colour`, `roof:material`, `roof:angle`. Keine OSM-ID.
-3. Die sieben bisherigen Themen behalten Layernamen (`<thema>`, Kameras unter Zoom 6 `<thema>_lo`; `trees` + `tree_lines`), Zoombereiche (0–14, `trees` 15) und Feldnamen unverändert. Geändert sind nur der Dateiname (datiert, aus `meta.json`), `meta.regions` (jetzt Anzahl statt Objekt je Region) und `meta.sets.<thema>` (ohne `lowZoomPoints`; `trees` mit `layers` statt `lines`).
-
 **Dateinamen und Cache:** Die Dateien tragen das Datum des Merge-Laufs im Namen, die App liest den Namen aus `meta.json` (`max-age=3600`). So mischen sich CDN-gecachte Range-Bytes (24 h) nie mit neuen Daten: eine neue Version hat einen neuen Namen. Die abgelöste Version bleibt mindestens 24 h liegen (`meta.retired`) und wird vom nächsten Lauf danach gelöscht, im Dauerzustand liegt genau eine Datei je Thema im Bucket. Bis die App umgestellt ist (Namen aus `meta.json` lesen statt fester `<set>.pmtiles`), muss ihr Stand die alten Namen noch finden; die unversionierten Dateien des alten Layouts werden beim ersten Merge als abgelöst eingetragen und 24 h später gelöscht.
 
 Die Eigenschaften der Punkt-Features sind die Felder der früheren Kachel-Datensätze (`FIELDS` in der Registry, die App baut daraus wieder die Arrays); Felder mit Standardwert (`dir` -1, Flags 0, leere Texte) fehlen. tippecanoe-Optionen der Punkte: `-r1 -b0 --drop-densest-as-needed -M 1000000 -O 250000` (nur ausgedünnt, wo eine Kachel zu groß wird). Die Kamerathemen haben unter Zoom 6 zusätzlich die attributlose Ebene `<thema>_lo`. Die App liest mit HTTP-Range-Anfragen (`pmtiles`-Bibliothek) über `VITE_OSM_BASE` (z. B. `https://orbis-osm.maltee.dev/`).
