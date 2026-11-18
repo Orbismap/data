@@ -28,7 +28,7 @@ Hosts einstufig unter `*.maltee.dev` (das kostenlose Zertifikat deckt nur eine E
 |---|---|---|---|---|
 | `orbis-live` | `orbis-live.maltee.dev` | Minuten-/Stundensnapshots, überschrieben | `max-age=60` bis `600` je Pfad, `stale-while-revalidate` | überschreibt sich selbst |
 | `orbis-data` | `orbis-data.maltee.dev` | täglich/wöchentlich: Zeugen-Karte, Vulkane, Radio, Kabel, Cams, PeeringDB, Wahlen, Häfen ... | `max-age=3600`, `stale-while-revalidate=86400` | Lifecycle: `archive/` nach 30 Tagen |
-| `orbis-osm` | `orbis-osm.maltee.dev` | OSM-Punktdaten als PMTiles (`<set>.pmtiles` ×6, `heat/cctv.json`, `meta.json`, Zwischendateien `src/`), siehe Abschnitt „OSM-Punktdaten (PMTiles)“ | PMTiles/Heat `max-age=86400`, `meta.json` `max-age=3600` | Build ersetzt die Dateien; alte JSON-Kacheln werden gelöscht |
+| `orbis-osm` | `orbis-osm.maltee.dev` | OSM-Daten als PMTiles (`<thema>-<datum>.pmtiles` ×8, `heat/cctv.json`, `meta.json` mit den aktuellen Dateinamen, `LICENSE.txt`), siehe Abschnitt „OSM-Daten (PMTiles)“ | PMTiles/Heat `max-age=86400`, `meta.json` `max-age=3600` | Jeder Lauf schreibt neue, datierte Dateien; die abgelösten werden nach 24 h gelöscht (im Dauerzustand eine Datei je Thema) |
 | `orbis-wetter` | `orbis-wetter.maltee.dev` | ICON-Wetterfelder (`v1/<run>/<var>/*.owx`, `v1/latest.json`) | Runs immutable, `latest.json` 120 s | Workflow behält 2 Runs (+ Lifecycle 7 Tage) |
 | `orbis-assets` | `orbis-assets.maltee.dev` | `models/`, `textures/`, große Teile von `public/data` | `immutable` unter Hash-Pfaden, `index.json` kurz | Lifecycle: nicht mehr referenzierte Hash-Pfade nach 90 Tagen |
 
@@ -115,7 +115,7 @@ Die Cloudflare-Uhr (`workers/clock`) startet die Workflows per `repository_dispa
 | `daily.yml` (`daily`) | täglich 03:05 | `fetch-data.ts --group daily` | `orbis-data` | 35 min |
 | `weekly.yml` (`weekly`) | montags 04:05 | `fetch-data.ts --group weekly` | `orbis-data` | 60 min |
 | `manual.yml` (nur *Run workflow*, kein Dispatch) | – | `fetch-data.ts --group manual` | `orbis-data` | 30 min |
-| `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `build`; eine Region ≥ 30 Tage alt, oder alle mit `all_regions`) | `orbis-osm` | je Job 350 min |
+| `osm-tiles.yml` (`osm-tiles`) | täglich 03:17 | `osm-tiles.mjs` (`plan` → `extract` je Region → `merge`; ein Dreißigstel der ~500 Regionen je Lauf, oder alle mit `all_regions`) | `orbis-osm` (nur die Welt-Dateien), Zwischenstücke in den Releases `osm-src-*` | je Region 180 min, merge 120 min |
 | `karte.yml` (`karte`) | manuell, bei Änderung von `collectors/karte/`, monatlich (nur `overlay`) | `collectors/karte/build-data.sh` (siehe [Karten-Daten](#karten-daten-orbis-karte)) | `orbis-osm` unter `karte/` | je Job 240 min |
 | `wetter.yml` (`wetter`) | 03:20, 09:20, 15:20, 21:20 | `wetter-icon.py` (+ `wetter-dem.py` auf Wunsch) | `orbis-wetter` (`vars.R2_BUCKET_WETTER`) | 60 min |
 
@@ -129,7 +129,7 @@ Aufgaben der Gruppen von `collectors/fetch-data.ts` (ein Task schreibt nur seine
 | `weekly` | `ccc-us` → `ccc-us.json`; `ukraine-support` → `ukraine-support.json`; `osm-datacenters` → `osm-datacenters/`; `wri-powerplants` → `wri/powerplants.json` (WRI Global Power Plant Database, CC BY 4.0, nur die gerenderten Spalten als Zeilen `[lon,lat,MW,Brennstoff,Name,Land,Jahr,Eigentümer,URL]`, statt 12 MB CSV je Browser); `street-panos` → `street/panos.json` (nur mit `MAPILLARY_TOKEN`) |
 | `manual` | selten wechselnde Quellen, nur per Actions → *manual* → *Run workflow* (Input `group`, Standard `manual`): `ports` → `ports.json` (Häfen-Ebene: NGA World Port Index, US-Regierungswerk ohne Urheberrechtsanspruch, + Upply Seaports, CC BY 4.0; Format `{v:1, ports:[[lon,lat,Name,UN/LOCODE,Land,Stufe,…]]}` wie früher `public/data/ports.json`; Logik in `collectors/ports.mjs`); `wahlen` → `wahlen/de.json` + `wahlen/de-geo.json` (Wahlen-Ebene: GERDA Bundestagswahlen CC BY 4.0, Landtagswahlen aus der Regionaldatenbank Deutschland dl-de/by-2-0 (via GERDA), auf Bundesländer aggregiert; Umrisse BKG VG2500 dl-de/by-2-0; Logik in `collectors/wahlen.mjs`) |
 
-Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `tsunami/PHEB.xml` alle 5 min nach `orbis-live`. Die Dateipfade sind dieselben wie bisher im `data`-Branch (`src/api/data.ts` der App liest sie unverändert); `orbis-osm` enthält PMTiles (siehe Abschnitt „OSM-Punktdaten (PMTiles)“).
+Tsunami-XML ist **kein** Sammler-Task: die Uhr spiegelt `tsunami/PAAQ.xml` und `tsunami/PHEB.xml` alle 5 min nach `orbis-live`. Die Dateipfade sind dieselben wie bisher im `data`-Branch (`src/api/data.ts` der App liest sie unverändert); `orbis-osm` enthält PMTiles (siehe Abschnitt „OSM-Daten (PMTiles)“).
 
 **Hilfsskripte:**
 
@@ -149,7 +149,7 @@ ORBIS_SRC=../orbis pnpm collect --group daily --out ./out --only volcanoes,mars 
 node collectors/manifest.mjs ./out - ./out-manifest.json                           # Manifest-Test
 ```
 
-Ohne `ORBIS_SRC` erwartet `build.mjs` den Checkout unter `./orbis` (so wie in CI). `osm-tiles.mjs` braucht `osmium` und `tippecanoe` und lädt einen Geofabrik-Auszug (siehe „OSM-Punktdaten (PMTiles)“, lokal mit einem kleinen Auszug testen); `wetter-icon.py` braucht `pip install -r collectors/wetter-requirements.txt`.
+Ohne `ORBIS_SRC` erwartet `build.mjs` den Checkout unter `./orbis` (so wie in CI). `osm-tiles.mjs` braucht `osmium` und `tippecanoe` und lädt einen Geofabrik-Auszug (siehe „OSM-Daten (PMTiles)“, lokal mit einem kleinen Auszug testen); `wetter-icon.py` braucht `pip install -r collectors/wetter-requirements.txt`.
 
 ### OpenSky-Schleife (Flugzeug-Überblick)
 
@@ -176,42 +176,54 @@ Die Schiffe vor Norwegen (Kystverket-Landstationen, Equinor-Offshore-Stationen, 
 - **Testlauf:** *Actions → BarentsWatch loop → Run workflow*. Im Log sollte `round 0: … ships … uploaded` stehen; `token HTTP 400/401` = falsche Client-Daten oder falscher Scope. Ohne Secrets beendet sich das Skript sofort (die API kennt keinen anonymen Zugang).
 - **Lizenz:** NLOD 2.0 (Norsk lisens for offentlige data), Quellenangabe „BarentsWatch / Kystverket“. Bedingungen: https://www.barentswatch.no/en/articles/api-terms-and-conditions/
 
-### OSM-Punktdaten (PMTiles)
+### OSM-Daten (PMTiles)
 
-`collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen sieben Datensätze, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Datensatz, Zoom 0–14, nur `trees` Zoom 15, nur Knoten, ODbL):
+`collectors/osm-tiles.mjs` (Workflow `osm-tiles`) macht aus den Geofabrik-Auszügen acht Themen, jeweils **eine PMTiles-Datei weltweit** in `orbis-osm` (Layername = Thema, ODbL). Die Themen stehen in der **Registry** `collectors/osm-themes.mjs`: ein Thema = ein Eintrag (Datei, Layer, Geometrieart `point`/`line`/`polygon`, osmium-Filter, Zuordnung der Felder, Zoombereich, Release-Gruppe). Ein neues Thema braucht keine neue Pipeline, nur diesen Eintrag (und ggf. einen Test).
 
-| Datei | Inhalt |
+| Datei (`<thema>-<datum>.pmtiles`) | Inhalt |
 |---|---|
-| `cctv.pmtiles` | Überwachungskameras (`man_made=surveillance` ohne ALPR/Webcams) |
-| `blitzer.pmtiles` | Blitzer und Rotlichtkameras (`highway=speed_camera`, Art über `type=enforcement`-Relationen) |
-| `alpr.pmtiles` | Kennzeichenleser (`surveillance:type=ALPR`) |
-| `webcam.pmtiles` | Webcams mit Link |
-| `wind.pmtiles` | einzelne Windräder |
-| `resource.pmtiles` | Schächte, Stollen, Bohrlöcher, Steinbrüche, Bergwerke, Öl/Gas/Raffinerien |
-| `trees.pmtiles` | **zwei Ebenen**, nur Zoom 15 (darüber überzoomt die Karte), für die 3D-Ansicht. Ebene `trees`: einzelne Bäume (`natural=tree`, nur Knoten, Punkte), Felder `species`, `height` (m, 0,1), `circumference` (m, 0,01), `leaf_type` (`broadleaved`/`needleleaved`/`mixed`/`leafless`), `leaf_cycle` (`deciduous`/`evergreen`/`semi_deciduous`/`semi_evergreen`); **kein** `id`, **kein** `genus` (die App leitet es aus `species` ab). Ebene `tree_lines`: Baumreihen (`natural=tree_row`) und Hecken (`barrier=hedge`) als LineString (Wege, geschlossene Wege bleiben Linien, auf ~1 m vereinfacht, ≤ 5 Nachkommastellen), Felder `kind` (`row`/`hedge`, immer gesetzt), `species` (nur Reihen), `height` (m, 0,1), `leaf_type`, `leaf_cycle`; keine ids. Fehlende Werte werden weggelassen, Standardwerte wählt der Renderer. Flächen, Wald und `natural=scrub` fehlen. Die Linien sind an Kachelgrenzen geschnitten (ohne Puffer) |
+| `cctv` | Überwachungskameras (`man_made=surveillance` ohne ALPR/Webcams), Zoom 0–14 |
+| `blitzer` | Blitzer und Rotlichtkameras (`highway=speed_camera`, Art über `type=enforcement`-Relationen), Zoom 0–14 |
+| `alpr` | Kennzeichenleser (`surveillance:type=ALPR`), Zoom 0–14 |
+| `webcam` | Webcams mit Link, Zoom 0–14 |
+| `wind` | einzelne Windräder, Zoom 0–14 |
+| `resource` | Schächte, Stollen, Bohrlöcher, Steinbrüche, Bergwerke, Öl/Gas/Raffinerien, Zoom 0–14 |
+| `trees` | **zwei Ebenen**, nur Zoom 15 (darüber überzoomt die Karte), für die 3D-Ansicht. Ebene `trees`: einzelne Bäume (`natural=tree`, Knoten), Felder `species`, `height` (m, 0,1), `circumference` (m, 0,01), `leaf_type` (`broadleaved`/`needleleaved`/`mixed`/`leafless`), `leaf_cycle` (`deciduous`/`evergreen`/`semi_deciduous`/`semi_evergreen`); **kein** `id`, **kein** `genus` (die App leitet es aus `species` ab). Ebene `tree_lines`: Baumreihen (`natural=tree_row`) und Hecken (`barrier=hedge`) als LineString (auf ~1 m vereinfacht, ≤ 5 Nachkommastellen), Felder `kind` (`row`/`hedge`, immer gesetzt), `species` (nur Reihen), `height`, `leaf_type`, `leaf_cycle`. Fehlende Werte werden weggelassen. Flächen, Wald und `natural=scrub` fehlen. Die Linien sind an Kachelgrenzen geschnitten (ohne Puffer) |
+| `roofs` | **neu**, nur Zoom 15: Gebäude und Gebäudeteile (`building`, `building:part`, Wege und Multipolygone) mit mindestens einem Dachtag (`roof:shape`, `roof:height`, `roof:levels`, `roof:colour`, `roof:material`, `roof:angle`) als Polygone, Ebene `roofs`. Eigenschaften = die OSM-Schlüssel selbst, Werte als Text (die App reicht sie als `tags` an `buildBuilding` weiter): `building`, `building:part`, `height`, `building:height`, `min_height`, `building:levels`, `building:min_level`, `roof:levels`, `roof:shape` (klein geschrieben), `roof:height`, `roof:direction`, `roof:orientation`, `roof:angle`, `roof:colour`, `roof:material`, `building:colour`, `colour`, `building:material`, `material` (nur gesetzte; Werte über 40 Zeichen entfallen). **Ganze Gebäude, jedes in genau einer Kachel** (tippecanoe `--no-clipping --no-duplication`, Koordinaten dürfen deshalb über den Kachelrand hinausgehen): die App legt die Dachebenen über das Rechteck um den Grundriss, ein Teilstück würde das Dach verziehen. Teile ohne Dachtag und alle Basis-Gebäude bleiben bei OpenFreeMap. Doppelte Gebäude über Kachelgrenzen gibt es nicht |
 | `heat/cctv.json` | Dichte-Zellen `[lon, lat, anzahl]` (0,01°) der ganzen Welt für die CCTV-Heatmap |
-| `meta.json` | `format: 7`, je Region Bauzeit und Zähler (`regions`), je Datensatz Größe/Anzahl (`sets`) |
+| `meta.json` | `format: 8`, `version` (Datum), **`files`**: aktueller Dateiname je Thema (`{ "roofs": "roofs-2026-12-03.pmtiles", … }`), `sets`: je Thema `bytes`, `features` (bei `trees` zusätzlich `layers`), `regions`, `oldest`/`newest` (Bauzeit der Regionen), `retired`: abgelöste Dateien mit Zeitpunkt (werden nach 24 h gelöscht) |
 | `LICENSE.txt` | ODbL-Hinweis |
-| `src/<region>/<set>.geojsonl`, `src/<region>/info.json` | Zwischendateien (Newline-delimited GeoJSON, je Region), Eingabe des Builds; `info.json` = Bauzeit der Region (`linesOk: false`, wenn der Linien-Durchlauf scheiterte: die Region gilt dann sofort wieder als fällig). `trees.geojsonl.gz` und `tree_lines.geojsonl.gz` liegen nicht in R2, sondern als Assets `<region>-trees.geojsonl.gz` / `<region>-tree_lines.geojsonl.gz` im GitHub-Release `osm-src` |
 
-Die Eigenschaften der Features sind die Felder der früheren Kachel-Datensätze (`FIELDS` im Sammler, `src/api/osmtiles.ts` der App baut daraus wieder die Arrays); Felder mit Standardwert (`dir` -1, Flags 0, leere Texte) fehlen. tippecanoe-Optionen: `-Z0 -z14 -r1 -b0 --drop-densest-as-needed -M 1000000 -O 250000` (Punkte werden nur ausgedünnt, wo eine Kachel zu groß wird; in den hohen Zoomstufen bleiben alle). Die App liest mit HTTP-Range-Anfragen (`pmtiles`-Bibliothek) und nimmt diese Quelle, wenn `VITE_OSM_BASE` gesetzt ist (z. B. `https://orbis-osm.maltee.dev/`).
+**Dateinamen und Cache:** Die Dateien tragen das Datum des Merge-Laufs im Namen, die App liest den Namen aus `meta.json` (`max-age=3600`). So mischen sich CDN-gecachte Range-Bytes (24 h) nie mit neuen Daten: eine neue Version hat einen neuen Namen. Die abgelöste Version bleibt mindestens 24 h liegen (`meta.retired`) und wird vom nächsten Lauf danach gelöscht, im Dauerzustand liegt genau eine Datei je Thema im Bucket. Bis die App umgestellt ist (Namen aus `meta.json` lesen statt fester `<set>.pmtiles`), muss ihr Stand die alten Namen noch finden; die unversionierten Dateien des alten Layouts werden beim ersten Merge als abgelöst eingetragen und 24 h später gelöscht.
 
-**Baumlinien:** Wege liefert der Stream (`-R`) nur mit Knoten-Referenzen, nicht mit Koordinaten. Der `extract` hebt deshalb im ersten Durchlauf die Wege (`w/natural=tree_row w/barrier=hedge`, OPL) auf und streamt den Auszug ein **zweites Mal** durch `osmium getid` (nur die benutzten Knoten, IDs liegen als Bitmap im Speicher; Europa etwa 70 Mio. Knoten ≈ 1 GB Zwischendatei). `osmium merge` + `osmium export --geometry-types=linestring` (Standort-Index `sparse_file_array` auf Platte, kein RAM-Bedarf) machen daraus Linien, der Sammler vereinfacht sie (Douglas-Peucker, 1 m) und schreibt `tree_lines.geojsonl.gz`. Der Build übergibt tippecanoe beide Dateien als `-L trees:…` und `-L tree_lines:…` (eine Datei, zwei Ebenen, gleicher Zoom). Kostet je Region etwa einen weiteren Download-/Filterlauf (Europa dann eher 5–6 h statt 3 h, Limit 350 min; siehe Workflow-Kommentar).
+Die Eigenschaften der Punkt-Features sind die Felder der früheren Kachel-Datensätze (`FIELDS` in der Registry, die App baut daraus wieder die Arrays); Felder mit Standardwert (`dir` -1, Flags 0, leere Texte) fehlen. tippecanoe-Optionen der Punkte: `-r1 -b0 --drop-densest-as-needed -M 1000000 -O 250000` (nur ausgedünnt, wo eine Kachel zu groß wird). Die Kamerathemen haben unter Zoom 6 zusätzlich die attributlose Ebene `<thema>_lo`. Die App liest mit HTTP-Range-Anfragen (`pmtiles`-Bibliothek) über `VITE_OSM_BASE` (z. B. `https://orbis-osm.maltee.dev/`).
 
-**Ablauf** (`osm-tiles.yml`): `plan` liest `src/*/info.json` und wählt die älteste Region, die älter als 30 Tage ist (Format-Wechsel zählt als veraltet) – oder alle 8 bei `all_regions`; `extract` läuft je Region als eigener Matrix-Job (osmium streamt den Auszug, Ausgabe nach `src/<region>/`, `info.json` zuletzt); `build` lädt `src/` aller Regionen, baut die sechs PMTiles mit tippecanoe (2.79.0, aus dem Quelltext gebaut und gecacht) und `heat/cctv.json`, lädt alles hoch und löscht die alten JSON-Kacheln (`cctv-*`, `blitzer-*` …). Eine Region wird ersetzt, indem ihre Zwischendateien ersetzt werden, die PMTiles entstehen immer aus allen Regionen.
+**Aufbau: Build je Region, Auslieferung je Thema.** Gebaut wird je **Geofabrik-Region** (die Blätter von `index-v1.json`, ca. 510 Länder/Unterregionen, größte Quebec 1,2 GB, die Sammelauszüge `us`, `us-*`, `dach`, `alps`, `sea`, `britain-and-ireland`, `great-britain`, `gcc-states` sind ausgeschlossen, siehe `osm-regions.mjs`). Region-Schlüssel = Pfad ohne `-latest.osm.pbf`, `/` → `_` (`europe_germany_hessen`).
 
-**Erster Lauf / leerer Bucket:** *Actions → OSM tiles → Run workflow* mit `all_regions` = true (alle 8 Regionen parallel, Europa ~3 h; die Jobs tauschen Daten über den Bucket aus, R2-Secrets sind Pflicht). Danach genügt der tägliche Dispatch der Uhr.
+1. **plan** wählt je Lauf ein Dreißigstel aller Regionen, die ältesten zuerst und nur solche, die älter als 30 Tage sind (Alter = Upload-Zeit des Assets `<region>.f8.points.tar`); `all_regions` nimmt die ältesten 250 (mehrmals starten, bis alle gebaut sind), `region` erzwingt eine.
+2. **extract** (Matrix-Job je Region): lädt den Auszug auf die Platte, ein osmium-Durchlauf für alle Punkte und die Wege der Linien (`tags-filter -R`, OPL-Strom), danach Knoten der Linien nachladen (`getid`, `export`), und je Polygon-Thema `tags-filter` (Dachtag) → `tags-filter` (Gebäude) → `export` (Flächen aus Wegen und Multipolygonen). Ergebnis: eine GeoJSONL-Zwischendatei je Quelle der Registry. **Besitzregel:** Geofabrik-Auszüge überlappen (Wege an der Grenze liegen in beiden, Brandenburg enthält Berlin) und `tile-join` entfernt keine Dubletten. Eine Region behält deshalb nur, was sie besitzt: Punkte, bei Linien und Flächen der erste Punkt liegt im Polygon der Region (aus dem Index) und nicht im Polygon einer kleineren, darin liegenden Region.
+3. **regional**: tippecanoe baut daraus die Regional-PMTiles; sie gehen als Assets in die **GitHub-Releases** (nicht nach R2): `osm-src-points` (ein tar je Region mit den sechs Punkt-Dateien, `heat-cctv.json` und `info.json`; als letztes hochgeladen = Zustand der Region), `osm-src-trees`, `osm-src-roofs` (je ein PMTiles je Region). Asset-Namen `<region>.f8.<gruppe>.<tar|pmtiles>`; `f8` = `FORMAT` (bei einer Änderung am Layout gelten ältere Stücke als veraltet). Ein Release fasst höchstens 1000 Assets (je ≤ 2 GB), darum die drei Releases.
+4. **merge**: lädt die Regional-Stücke **aller** Regionen und führt sie je Thema mit `tile-join -pk` zur Welt-Datei zusammen (liest PMTiles direkt, verschmilzt Kacheln an den Nähten; getestet: identisch zum Direktbau, 100 Dateien/470 MB in 22 s mit 1,2 GB RAM), lädt sie mit neuem Namen nach R2, danach `meta.json`, und löscht abgelöste Versionen nach 24 h (samt Eintrag in `manifest.json`).
 
-**Lokal testen** (kleiner Auszug, `brew install osmium-tool tippecanoe pmtiles`):
+R2 enthält nur die Welt-Dateien (geschätzt: roofs < 1 GB, trees ≈ 0,4 GB, die Punkte zusammen ≈ 0,3 GB, jeweils kurz doppelt). Ein eigener Gebäude-Layer aller Gebäude wäre dagegen ~9–10 GB (Hessen: 2,8 Mio Gebäude = 37,5 MB bei Zoom 14, hochgerechnet auf 714 Mio) und sprengt den Free Tier: die Grundkarte bleibt bei OpenFreeMap.
+
+**Werkzeug-Entscheidung (Spike, November 2026):** osmium + tippecanoe statt Planetiler. Hessen, Dächer: osmium+tippecanoe 4,9–5,1 MB in ~16 s, Planetiler (YAML, `generate-custom`) 6,6 MB in 16 s; Planetiler schneidet Gebäude an Kachelgrenzen (+10 % Teilstücke, kein No-Clipping), was das Dachmodell der App verfälschen würde; die Punktsätze (Relationen für Blitzer, Webcam-Link, `_lo`-Ebenen) wären nur mit einem Java-Profil (JDK + Jar im CI) und neuer Validierung möglich.
+
+**Erster Lauf / leerer Bucket:** *Actions → OSM tiles → Run workflow* mit `all_regions` = true, mehrmals wiederholen (je Lauf 250 Regionen, die Matrix läuft 20 parallel; jeder Lauf endet mit einem merge, der schon aus den vorhandenen Stücken eine Welt-Datei baut). Danach genügt der tägliche Dispatch der Uhr. *merge_only* führt nur zusammen. **Aufräumen nach der Umstellung (von Hand):** das alte Release `osm-src` und das Präfix `src/` in `orbis-osm` (Zwischendateien des alten Layouts) löschen.
+
+**Lokal testen** (`brew install osmium-tool tippecanoe pmtiles`, Auszüge siehe `~/osm/README.md`): alles von Extrakt über Regional-Stücke bis Merge für zwei lokale Auszüge, ohne Upload:
 
 ```bash
-node collectors/osm-tiles.mjs extract ./osm-test bremen --url https://download.geofabrik.de/europe/germany/bremen-latest.osm.pbf
-node collectors/osm-tiles.mjs build ./osm-test/src ./osm-test/dist     # ./osm-test/dist/*.pmtiles, heat/cctv.json, meta.json
-pmtiles show ./osm-test/dist/cctv.pmtiles
-node collectors/osm-tiles.mjs plan ./osm-test [region|all]             # welche Regionen wären fällig
+node collectors/osm-tiles.mjs local ./osm-test \
+  europe_germany_berlin=/Users/malte/osm/geofabrik/berlin-261116.osm.pbf \
+  europe_germany_hessen=/Users/malte/osm/geofabrik/hessen-261115.osm.pbf   # ~45 s
+ls ./osm-test/dist ./osm-test/upload       # Welt-Dateien + meta.json; die Release-Assets
+pmtiles show ./osm-test/dist/roofs-*.pmtiles
 ```
 
-Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mit einem Server ausliefern, der Range-Anfragen und CORS (`Access-Control-Allow-Origin`, `Range` erlaubt, `ETag` freigegeben) beherrscht.
+`key=pbf@west,süd,ost,nord` begrenzt, was die Region besitzt (Test der Naht mit zwei Teilen desselben Auszugs). Die einzelnen Schritte (`plan <index.json> <assets.json>`, `extract`, `regional`, `merge`) stehen im Kopf von `osm-tiles.mjs`. Die App-Seite lokal: `VITE_OSM_BASE=http://localhost:8080/` setzen und `dist` mit einem Server ausliefern, der Range-Anfragen und CORS (`Access-Control-Allow-Origin`, `Range` erlaubt, `ETag` freigegeben) beherrscht.
+
+**Später in dieselbe Registry** (nur notiert, nicht umgebaut): `build-airport-buildings.mjs`, `build-indoor.mjs`, `build-airportplan-osmium.mjs` und der Overpass-Teil in `fetch-data.ts` arbeiten ebenfalls mit osmium auf Geofabrik-Auszügen und wären Polygon-/Linien-Themen.
 
 ### Karten-Daten (Orbis Karte)
 

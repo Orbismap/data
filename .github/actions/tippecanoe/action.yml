@@ -1,0 +1,25 @@
+name: tippecanoe
+description: felt/tippecanoe (incl. tile-join) built from source and cached; puts it on the PATH
+inputs:
+  version:
+    description: tag of felt/tippecanoe
+    default: '2.79.0'
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/tippecanoe
+        key: tippecanoe-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev zlib1g-dev
+        git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src
+        make -C /tmp/tippecanoe-src -j"$(nproc)"
+        make -C /tmp/tippecanoe-src install PREFIX="$HOME/tippecanoe"
+    - shell: bash
+      run: |
+        echo "$HOME/tippecanoe/bin" >> "$GITHUB_PATH"
+        "$HOME/tippecanoe/bin/tippecanoe" --version

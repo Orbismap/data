@@ -1,23 +1,19 @@
 name: OSM tiles
 
-# OSM-Punktdaten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume) als PMTiles, eine Datei je Datensatz weltweit
-# (collectors/osm-tiles.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`) in drei Schritten:
-#   plan     liest src/<region>/info.json aus dem Bucket orbis-osm und wählt die Region, die älter als 30 Tage ist (die
-#            älteste; die Regionen verteilen sich so über den Monat) - oder alle 8 bei `all_regions`
-#   extract  eine Matrix-Job je Region: streamt den Geofabrik-Auszug durch osmium und lädt die Zwischendateien
-#            src/<region>/<set>.geojsonl (+ info.json) nach orbis-osm
-#   build    lädt src/ aller Regionen, baut mit tippecanoe <set>.pmtiles (+ heat/cctv.json, meta.json) und lädt sie hoch;
-#            löscht danach die alten JSON-Kacheln im Bucket
-# Zwischendateien: die der Bäume (trees.geojsonl.gz, ~5 GB roh) und der Baumlinien (tree_lines.geojsonl.gz, Baumreihen und
-# Hecken, die zweite Ebene `tree_lines` von trees.pmtiles) liegen NICHT in R2 (Free Tier 10 GB), sondern als Assets
-# `<region>-trees.geojsonl.gz` / `<region>-tree_lines.geojsonl.gz` im GitHub-Release `osm-src` dieses Repos (öffentlich,
-# kostenlos). Die übrigen Sätze bleiben vorerst in orbis-osm/src.
-# Die Baumlinien brauchen im extract einen zweiten Durchlauf über den Auszug (Knoten der Wege nachladen), das kostet je
-# Region etwa einen weiteren Download + Filterlauf; scheitert er, bleiben die Punkte erhalten und die Region gilt als
-# veraltet (info.json `linesOk: false`), `plan` nimmt sie beim nächsten Lauf sofort wieder.
-# Ziel: Bucket orbis-osm (R2-Zugangsdaten sind Pflicht: die Jobs tauschen die Daten über den Bucket aus).
-# Erster Lauf (leerer Bucket): `all_regions` aktivieren, dann werden alle Regionen in einem Lauf gebaut (Europa dauert ~3 h,
-# die Regionen laufen parallel in der Matrix, jede in ihrem eigenen Job mit 6-h-Limit).
+# OSM-Daten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume, Dächer) als PMTiles, eine Datei je Thema weltweit
+# (collectors/osm-tiles.mjs, Themen-Registry collectors/osm-themes.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`):
+#   plan     Geofabrik-Index (index-v1.json) -> ca. 500 Regionen (Länder/Unterregionen, je < 1,2 GB); wählt die ältesten, die älter als
+#            30 Tage sind (ein Dreißigstel aller Regionen je Lauf = rollierend), oder alle bei `all_regions` (höchstens 250 je Lauf).
+#            Alter einer Region = Upload-Zeit ihres Assets `<region>.f<FORMAT>.points.tar` im Release osm-src-points
+#   extract  Matrix-Job je Region: lädt den Auszug, schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und
+#            lädt sie als Assets in die GitHub-Releases osm-src-points (ein tar je Region mit den sechs Punktsätzen, zuletzt: das ist
+#            der Zustand), osm-src-trees und osm-src-roofs (je Release höchstens 1000 Assets, je Asset höchstens 2 GB)
+#   merge    lädt die Regional-Stücke ALLER Regionen, führt sie je Thema mit tile-join zur Welt-Datei zusammen
+#            (<thema>-<datum>.pmtiles, Verweis in meta.json), lädt sie nach orbis-osm und löscht abgelöste Versionen, sobald die
+#            CDN-Cachezeit (24 h) vorbei ist. Im Dauerzustand liegt je Thema genau eine Datei im Bucket.
+# In R2 liegen nur die fertigen Welt-Dateien (+ heat/cctv.json, meta.json, LICENSE.txt), die Zwischenstücke nur in den Releases.
+# R2-Zugangsdaten sind für `merge` Pflicht; `plan` und `extract` brauchen nur das GitHub-Token.
+# Erster Lauf: `all_regions` aktivieren und so oft wiederholen, bis alle Regionen gebaut sind (je Lauf 250, die ältesten zuerst).
 
 on:
   repository_dispatch:
@@ -25,11 +21,15 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: 'Region erzwingen (europe, russia, asia, north-america, central-america, south-america, africa, oceania) - leer: älteste fällige'
+        description: 'Region erzwingen (Schlüssel wie europe_germany_hessen, siehe Plan-Log) - leer: die ältesten fälligen'
         type: string
         default: ''
       all_regions:
-        description: 'Alle Regionen in einem Lauf bauen (z. B. beim ersten Lauf mit leerem Bucket)'
+        description: 'Alle Regionen bauen (höchstens 250 je Lauf, die ältesten zuerst), z. B. beim ersten Lauf'
+        type: boolean
+        default: false
+      merge_only:
+        description: 'Nur zusammenführen (aus den vorhandenen Regional-Stücken), keine Region bauen'
         type: boolean
         default: false
 
@@ -45,7 +45,7 @@ env:
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
   AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
   AWS_DEFAULT_REGION: auto
-  TIPPECANOE_VERSION: '2.79.0'
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   plan:
@@ -54,11 +54,9 @@ jobs:
     outputs:
       regions: ${{ steps.plan.outputs.regions }}
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       REGION: ${{ github.event.inputs.region || github.event.client_payload.region || '' }}
       ALL_REGIONS: ${{ github.event.inputs.all_regions || github.event.client_payload.all_regions || 'false' }}
+      MERGE_ONLY: ${{ github.event.inputs.merge_only || 'false' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,16 +65,18 @@ jobs:
       - name: Plan
         id: plan
         run: |
-          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
-            echo '::error::R2 credentials missing - osm-tiles exchanges its data through the bucket orbis-osm'
-            exit 1
+          if [ "$MERGE_ONLY" = "true" ]; then echo 'regions=[]' >> "$GITHUB_OUTPUT"; exit 0; fi
+          curl -sSfL --retry 3 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
+          # Alter der Regionen: Assets des Zustand-Releases (fehlt es noch: alle Regionen gelten als fällig)
+          if id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null); then
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[]' | jq -s '{assets: .}' > assets.json
+          else
+            echo '{"assets":[]}' > assets.json
+            echo '::notice::release osm-src-points does not exist yet - all regions count as due'
           fi
-          mkdir -p state
-          aws s3 sync s3://orbis-osm/src state/src --exclude "*" --include "*/info.json" \
-            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no state in orbis-osm yet - all regions count as due'
           ARG="$REGION"
           if [ "$ALL_REGIONS" = "true" ]; then ARG=all; fi
-          REGIONS=$(node collectors/osm-tiles.mjs plan state $ARG)
+          REGIONS=$(node collectors/osm-tiles.mjs plan index.json assets.json $ARG)
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
           echo "regions to refresh: $REGIONS"
 
@@ -84,56 +84,55 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.regions != '[]' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 180
     permissions:
-      contents: write # release osm-src (tree intermediates)
+      contents: write # releases osm-src-*
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         region: ${{ fromJSON(needs.plan.outputs.regions) }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: sudo apt-get install -y --no-install-recommends osmium-tool
+      - uses: ./.github/actions/tippecanoe
       - name: Extract ${{ matrix.region }}
-        run: node collectors/osm-tiles.mjs extract out "${{ matrix.region }}"
-      - name: Upload tree intermediate to the GitHub release osm-src
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # before info.json goes to R2 (below): a failed upload then does not count as refreshed
-          gh release view osm-src >/dev/null 2>&1 \
-            || gh release create osm-src --prerelease --title "OSM build intermediates" \
-                 --notes "Intermediates of the osm-tiles workflow (gzipped GeoJSON lines per region). Data © OpenStreetMap contributors (ODbL)." \
-            || gh release view osm-src >/dev/null   # another matrix job created it first
-          cp "out/src/${{ matrix.region }}/trees.geojsonl.gz" "out/${{ matrix.region }}-trees.geojsonl.gz"
-          gh release upload osm-src "out/${{ matrix.region }}-trees.geojsonl.gz" --clobber
-          # tree rows and hedges (missing when the line pass failed: then the previous asset stays and info.json says linesOk: false)
-          if [ -s "out/src/${{ matrix.region }}/tree_lines.geojsonl.gz" ]; then
-            cp "out/src/${{ matrix.region }}/tree_lines.geojsonl.gz" "out/${{ matrix.region }}-tree_lines.geojsonl.gz"
-            gh release upload osm-src "out/${{ matrix.region }}-tree_lines.geojsonl.gz" --clobber
-          fi
-      - name: Upload intermediates to R2 (orbis-osm/src)
+          curl -sSfL --retry 3 -A "Orbis-data/1.0 (+https://github.com/${GITHUB_REPOSITORY})" -o index.json https://download.geofabrik.de/index-v1.json
+          node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
+      - name: Regional PMTiles
         run: |
-          ls -la "out/src/${{ matrix.region }}"
-          # info.json last: it is what `plan` looks at, so a failed upload does not count as refreshed
-          aws s3 sync "out/src/${{ matrix.region }}" "s3://orbis-osm/src/${{ matrix.region }}/" --delete --exclude info.json --exclude "*.gz" \
-            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
-          aws s3 cp "out/src/${{ matrix.region }}/info.json" "s3://orbis-osm/src/${{ matrix.region }}/info.json" \
-            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --cache-control "no-store" --only-show-errors
+          node collectors/osm-tiles.mjs regional out "${{ matrix.region }}"
+          ls -la out/upload
+      - name: Upload to the GitHub releases osm-src-<group>
+        run: |
+          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          # roofs and trees first, the points tar last: it is the state `plan` looks at, so a failed upload does not count as refreshed
+          for g in roofs trees points; do
+            for f in out/upload/*."$g".*; do
+              [ -e "$f" ] || continue
+              gh release view "osm-src-$g" >/dev/null 2>&1 \
+                || gh release create "osm-src-$g" --prerelease --title "OSM regional pieces: $g" \
+                     --notes "Regional PMTiles of the osm-tiles workflow (group $g), merged to the world files by its merge job. Data © OpenStreetMap contributors (ODbL)." \
+                || gh release view "osm-src-$g" >/dev/null   # another matrix job created it first
+              gh release upload "osm-src-$g" "$f" --clobber
+            done
+            # assets of this region from an older format are obsolete now
+            id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[] | "\(.id) \(.name)"' \
+              | awk -v r="${{ matrix.region }}" -v cur=".f$FORMAT." 'index($2, r ".f") == 1 && index($2, cur) == 0 { print $1 }' \
+              | while read -r aid; do gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$aid"; done
+          done
 
-  build:
+  merge:
     needs: [plan, extract]
-    # also when single regions failed: the others are still in src/ and the tiles are built from what exists
-    if: ${{ !cancelled() && needs.plan.outputs.regions != '[]' && needs.extract.result != 'skipped' }}
+    # also when single regions failed: the others are in the releases and the world files are built from what exists
+    if: ${{ !cancelled() && (needs.plan.outputs.regions != '[]' || github.event.inputs.merge_only == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -143,55 +142,52 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: tippecanoe (cache)
-        id: tippecanoe
-        uses: actions/cache@v4
-        with:
-          path: ~/tippecanoe
-          key: tippecanoe-${{ env.TIPPECANOE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-      - name: tippecanoe (build felt/tippecanoe ${{ env.TIPPECANOE_VERSION }})
-        if: steps.tippecanoe.outputs.cache-hit != 'true'
+      - uses: ./.github/actions/tippecanoe
+      - name: Regional pieces of all regions (releases osm-src-*)
         run: |
-          sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev zlib1g-dev
-          git clone --depth 1 --branch "$TIPPECANOE_VERSION" https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src
-          make -C /tmp/tippecanoe-src -j"$(nproc)"
-          make -C /tmp/tippecanoe-src install PREFIX="$HOME/tippecanoe"
-      - run: echo "$HOME/tippecanoe/bin" >> "$GITHUB_PATH"
-      - name: Intermediates of all regions (orbis-osm/src)
-        run: |
-          mkdir -p work
-          aws s3 sync s3://orbis-osm/src work/src --exclude "*" --include "*/*.geojsonl" --include "*/info.json" \
-            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors
-          du -sh work/src/*
-      - name: Tree intermediates (GitHub release osm-src)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p work/trees
-          gh release download osm-src --pattern '*-trees.geojsonl.gz' --pattern '*-tree_lines.geojsonl.gz' --dir work/trees --clobber || echo '::notice::no tree intermediates in the release yet'
-          for f in work/trees/*-trees.geojsonl.gz work/trees/*-tree_lines.geojsonl.gz; do
-            [ -e "$f" ] || continue
-            b=$(basename "$f")
-            case "$b" in
-              *-tree_lines.geojsonl.gz) r=${b%-tree_lines.geojsonl.gz}; n=tree_lines.geojsonl.gz ;;
-              *) r=${b%-trees.geojsonl.gz}; n=trees.geojsonl.gz ;;
-            esac
-            mkdir -p "work/src/$r"
-            mv "$f" "work/src/$r/$n"
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo '::error::R2 credentials missing - the world files go to the bucket orbis-osm'
+            exit 1
+          fi
+          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          mkdir -p work/assets
+          expected=0
+          for g in points trees roofs; do
+            id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
+            n=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[].name' | grep -c "\.f$FORMAT\." || true)
+            expected=$((expected + n))
+            gh release download "osm-src-$g" --pattern "*.f$FORMAT.*" --dir work/assets --clobber
           done
-          du -sh work/src/*/trees.geojsonl.gz work/src/*/tree_lines.geojsonl.gz 2>/dev/null || true
-      - name: Build PMTiles
+          have=$(ls work/assets | wc -l)
+          echo "assets: $have of $expected"
+          [ "$have" -eq "$expected" ] || { echo '::error::not all regional pieces were downloaded'; exit 1; }
+          du -sh work/assets
+      - name: Merge (tile-join)
         run: |
-          tippecanoe --version
-          node collectors/osm-tiles.mjs build work/src dist
+          aws s3 cp s3://orbis-osm/meta.json work/prev-meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors || echo '::notice::no meta.json in the bucket yet'
+          node collectors/osm-tiles.mjs merge work/assets dist --prev work/prev-meta.json --delete-list work/delete.txt
+          mkdir meta && mv dist/meta.json meta/meta.json # uploaded last
           ls -laR dist
       - name: Upload to R2 (orbis-osm)
         run: |
+          # new versions first (new names: nothing is overwritten, the live ones keep working), meta.json (the reference) last
           collectors/upload.sh dist orbis-osm "public, max-age=86400"
-          # the state file wants a shorter cache and goes last
-          aws s3 cp dist/meta.json s3://orbis-osm/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+          aws s3 cp meta/meta.json s3://orbis-osm/meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
             --cache-control "public, max-age=3600" --content-type application/json --only-show-errors
-      - name: Remove the old JSON tiles (no orphans)
+      - name: Delete superseded versions (older than the CDN cache time)
         run: |
-          aws s3 rm s3://orbis-osm/ --recursive --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors \
-            --exclude "*" --include "cctv-*" --include "blitzer-*" --include "alpr-*" --include "webcam-*" --include "wind-*" --include "resource-*"
+          EP="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          [ -s work/delete.txt ] || { echo 'nothing to delete'; exit 0; }
+          while read -r key; do
+            echo "delete $key"
+            aws s3 rm "s3://orbis-osm/$key" --endpoint-url "$EP" --only-show-errors
+          done < work/delete.txt
+          aws s3 cp s3://orbis-osm/manifest.json work/manifest.json --endpoint-url "$EP" --only-show-errors
+          node -e "
+            const fs = require('fs');
+            const m = JSON.parse(fs.readFileSync('work/manifest.json', 'utf8'));
+            for (const k of fs.readFileSync('work/delete.txt', 'utf8').split('\n').filter(Boolean)) delete m[k];
+            fs.writeFileSync('work/manifest.json', JSON.stringify(m));
+          "
+          aws s3 cp work/manifest.json s3://orbis-osm/manifest.json --endpoint-url "$EP" \
+            --cache-control "public, max-age=60, stale-while-revalidate=300" --content-type application/json --only-show-errors
