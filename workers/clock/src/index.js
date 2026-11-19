@@ -118,7 +118,6 @@ export const DISPATCH = [
   { id: 'health', event: 'health', minutes: [45] }, // hourly staleness check (collectors/health.mjs), opens/closes the issue "Datenstatus: Probleme"
   { id: 'daily', event: 'daily', hours: [3], minutes: [5] },
   { id: 'weekly', event: 'weekly', days: [1], hours: [4], minutes: [5] }, // Mondays
-  { id: 'osm-tiles', event: 'osm-tiles', hours: [3], minutes: [17] },
   { id: 'wetter', event: 'wetter', hours: [3, 9, 15, 21], minutes: [20] }, // ICON runs 00/06/12/18 UTC are complete ~3 h later
 ];
 

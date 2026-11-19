@@ -3,50 +3,39 @@
 // geometry): cctv, blitzer, alpr, webcam, wind, resource (points, zoom 0-14), trees (single trees + the line layer `tree_lines`)
 // and roofs (buildings with roof tags as polygons), the last two z15 only.
 //
-// The build is split by UNIT (a Geofabrik extract of at most UNIT_MAX_BYTES, from the top of the index down, see osm-regions.mjs), the delivery is not:
-//   units <index.json>                                 prints the JSON list of all unit keys
-//   sizes <index.json> [--max bytes]                   HEAD requests (slowly) for the pbf sizes the selection needs -> collectors/osm-sizes.json
-//                                                      (committed; the index has no sizes). Run it when Geofabrik adds regions or the limit changes
-//   plan <index.json> <assets.json> [region|all]       prints the JSON list of unit keys to refresh: the oldest ones older than
-//                                                      MAX_AGE_DAYS (a 30th of all units per run = rolling); `assets.json` is
-//                                                      `gh release view osm-src-points --json assets` (the upload time of a region's
-//                                                      state asset says how old it is)
-//   extract <outDir> <region> [--index f] [--url pbf] [--own-bbox w,s,e,n]
-//                                                      downloads the region's extract and writes the intermediates (GeoJSON lines,
-//                                                      one per source of the registry) to <outDir>/src/<region>/ + info.json. Only
-//                                                      features the region OWNS are kept (osm-regions.mjs), so overlapping
-//                                                      extracts do not produce duplicates
-//   regional <outDir> <region>                         tippecanoe: one regional PMTiles per file in <outDir>/regional/<region>/, and
-//                                                      the assets for the GitHub releases osm-src-<group> in <outDir>/upload/
-//   merge <assetsDir> <distDir> [--prev meta.json] [--delete-list f] [--units units.json] [--date YYYY-MM-DD]
-//                                                      unpacks the regional assets of ALL regions and joins them per file with
-//                                                      tile-join: <distDir>/<file>-<date>.pmtiles, heat/cctv.json, meta.json,
-//                                                      LICENSE.txt; the superseded versions go into meta.retired and, once the CDN
-//                                                      cache time has passed (24 h), into the delete list
-//   local <workDir> <key=pbf[@w,s,e,n]>...             all of the above for local extracts (test; the box = the region's ownership)
-// Data © OpenStreetMap contributors (ODbL), extracts by Geofabrik.
+// The build reads the PLANET (planet-latest.osm.pbf, ~90 GB, from a mirror) once per job; the themes are sparse, so what is kept is small:
+//   build [--groups points,trees] [--out dir] [--pbf file] [--part file] [--date YYYY-MM-DD]
+//                                          downloads the planet (mirrors in order, first that works; or takes --pbf), writes the intermediates
+//                                          (GeoJSON lines per source of the groups) to <out>/src/, deletes the planet after its last pass,
+//                                          builds the world PMTiles of the groups with tippecanoe into <out>/dist/ (+ heat/cctv.json), and
+//                                          writes <part> (JSON: file names, sizes, feature counts) for `publish`
+//   publish <partsDir> <distDir> [--prev meta.json] [--delete-list f] [--manifest manifest.json] [--date YYYY-MM-DD]
+//                                          joins the part files of all jobs to <distDir>/meta.json (+ LICENSE.txt); the superseded versions
+//                                          go into meta.retired and, once the CDN cache time has passed (24 h), into the delete list;
+//                                          --manifest: the bucket's manifest.json is updated in place (new files in, deleted ones out)
+// Groups (GROUPS in the registry) are the units of work of the two jobs: `points` + `trees` read nodes (one streamed pass) and ways (second
+// pass), `roofs` reads ways and relations (osmium needs the file on disk for that, two passes). Data © OpenStreetMap contributors (ODbL).
 
-import { spawn } from 'node:child_process';
-import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
+import { RULES } from './manifest.mjs';
 import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature } from './osm-themes.mjs';
-import { boxOwner, leafRegions, makeOwner, regionKey, regionTree, unitRegions, UNIT_MAX_BYTES, findRegion, AGGREGATES } from './osm-regions.mjs';
 
-export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, AGGREGATES, makeOwner };
+export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature };
 
-const MAX_AGE_DAYS = 30;
-/** GitHub release assets are limited to 2 GiB; stay below it so that the failure comes before the upload */
-const ASSET_MAX_BYTES = 1.9e9;
-/** units per run with `all` (first run / migration: in batches, the oldest first; every run ends with a merge) */
-const MAX_ALL = 40;
-/** committed table { key: pbf bytes } of the Geofabrik extracts (written by `sizes`, the index has no sizes); decides which regions are units */
-export const SIZES_FILE = new URL('./osm-sizes.json', import.meta.url);
+/** the planet from these mirrors, in this order (measured 2026-11: gwdg ~145 MB/s, planet.openstreetmap.org ~45, fau ~27, bbbike ~10) */
+export const PLANET_MIRRORS = [
+  'https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf',
+  'https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf',
+  'https://ftp.fau.de/osm-planet/pbf/planet-latest.osm.pbf',
+];
 /** CDN cache time of the bucket files (Cache-Control max-age=86400): a replaced version stays this long */
 export const CDN_TTL_MS = 24 * 3600e3;
 const CELL = 100; // heatmap cells per degree (0.01° ≈ 1 km)
-/** bump when the layout of the regional pieces or the fields change: older pieces count as stale and are rebuilt */
+/** version of meta.json and the file layout the app reads */
 export const FORMAT = 9;
 const ATTRIBUTION = '© OpenStreetMap contributors (ODbL)';
 
@@ -108,7 +97,7 @@ function lineWriter(path) {
   };
 }
 
-/** User-Agent with a contact (Geofabrik asks for one) */
+/** User-Agent with a contact (the mirrors ask for one) */
 const USER_AGENT = `Orbis-data/1.0 (+https://github.com/${process.env.GITHUB_REPOSITORY ?? 'Orbismap/data'})`;
 /** shell command that writes the .osm.pbf of `src` (a local file) to stdout */
 const pbfInput = (src) => `cat "${src}"`;
@@ -129,22 +118,23 @@ export function backoffMs(attempt, retryAfter = null) {
   return Math.round(base * (1 + Math.random() * 0.25));
 }
 
-/** exit code of `extract` when Geofabrik cannot be reached at all from this runner (TCP connect fails): the workflow builds the unit again on another runner */
-export const UNREACHABLE_EXIT = 75;
-export class GeofabrikUnreachable extends Error {
+
+/** no TCP connection to a mirror from this runner (curl exit 6/7): the next mirror is tried */
+export class MirrorUnreachable extends Error {
   constructor(url, attempts) {
-    super(`geofabrik-unreachable: no connection to ${url} (${attempts} attempts)`);
-    this.name = 'GeofabrikUnreachable';
+    super(`mirror-unreachable: no connection to ${url} (${attempts} attempts)`);
+    this.name = 'MirrorUnreachable';
   }
 }
 /** curl exit codes for "no connection": 6 (cannot resolve host), 7 (cannot connect) */
 const NO_CONNECTION = [6, 7];
 
+
 /**
  * Downloads `url` to `file`, one request at a time, resuming a partial file (-C -). On a failure (429/503/5xx, connect error, stall) it waits
  * (Retry-After if the server sent one, else growing pauses) and continues, up to `attempts` times. A refusal that is no overload (404 …) fails at once.
  * No connection at all (no HTTP answer, curl exit 6/7) will not get better on this runner (an address that is blocked stays blocked): after
- * `connectAttempts` tries with short pauses it throws GeofabrikUnreachable.
+ * `connectAttempts` tries with short pauses it throws MirrorUnreachable.
  */
 export async function download(url, file, attempts = 8, { connectAttempts = 3, connectPauseMs = [5000, 30_000] } = {}) {
   const hdr = `${file}.headers`;
@@ -165,7 +155,7 @@ export async function download(url, file, attempts = 8, { connectAttempts = 3, c
     }
     if (failed && code === 0 && NO_CONNECTION.includes(exitCode)) {
       rmSync(hdr, { force: true });
-      if (++noConnection >= connectAttempts) throw new GeofabrikUnreachable(url, noConnection);
+      if (++noConnection >= connectAttempts) throw new MirrorUnreachable(url, noConnection);
       const ms = connectPauseMs[noConnection - 1] ?? connectPauseMs.at(-1) ?? 0;
       console.error(`download ${url}: no connection (curl ${exitCode}, ${noConnection}/${connectAttempts}) – retrying in ${Math.round(ms / 1000)} s`);
       await sleep(ms);
@@ -197,10 +187,53 @@ function run(cmd, args) {
   });
 }
 
+const stamp = () => new Date().toISOString().slice(11, 19);
+/** free disk space of the working directory, for the log */
+const freeSpace = () => {
+  try {
+    const s = statfsSync('.');
+    return `${Math.round((s.bavail * s.bsize) / 1e9)} GB free`;
+  } catch {
+    return '';
+  }
+};
+/** runs `fn` and logs its start, end (duration, free disk) and, for long silent steps (osmium prints nothing), a line every `heartbeatMs` */
+export async function timed(label, fn, heartbeatMs = 300_000) {
+  const t0 = Date.now();
+  console.log(`[${stamp()}] ${label} ...`);
+  const beat = setInterval(() => console.log(`[${stamp()}] ${label}: still running (${Math.round((Date.now() - t0) / 60000)} min, ${freeSpace()})`), heartbeatMs);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(beat);
+    console.log(`[${stamp()}] ${label}: done in ${Math.round((Date.now() - t0) / 1000)} s (${freeSpace()})`);
+  }
+}
+
+/**
+ * Downloads the planet from the first mirror that works (`urls` in order). A partial file of a failed mirror is removed: another mirror may
+ * serve another planet version, so resuming across mirrors would corrupt the file. Returns the URL used.
+ */
+export async function downloadFirst(urls, file, dl = (u, f) => download(u, f, 4)) {
+  let last;
+  for (const url of urls) {
+    try {
+      await dl(url, file);
+      return url;
+    } catch (e) {
+      last = e;
+      console.error(`mirror ${url} failed: ${e.message}`);
+      rmSync(file, { force: true });
+    }
+  }
+  throw last ?? new Error('no mirror given');
+}
+
 /** the `-x print_record_separator=false` GeoJSON lines of an osmium export, parsed */
 async function* geojsonLines(file) {
   for await (const line of createInterface({ input: createReadStream(file), crlfDelay: Infinity })) if (line) yield JSON.parse(line);
 }
+
 
 /**
  * Lines (the sources with geometry 'line', e.g. tree rows and hedges) as <dir>/<id>.geojsonl. Input: `waysFile`, the OPL lines of the
@@ -208,7 +241,7 @@ async function* geojsonLines(file) {
  * the ways), then osmium merges nodes + ways in a temp dir and exports them as linestrings (closed ways stay lines).
  * Returns the number of lines written.
  */
-async function extractLines(dir, pbf, waysFile, id, source, owner) {
+async function extractLines(dir, pbf, waysFile, id, source) {
   const tmp = join(dir, `lines-tmp-${id}`);
   mkdirSync(tmp, { recursive: true });
   const idsFile = join(tmp, 'node-ids.txt');
@@ -236,7 +269,6 @@ async function extractLines(dir, pbf, waysFile, id, source, owner) {
       if (f.geometry?.type !== 'LineString') continue;
       const rec = source.lineRecord(f.properties ?? {}, f.geometry.coordinates);
       if (!rec) continue;
-      if (!owner(rec[0][0][0], rec[0][0][1])) continue;
       await out.write(JSON.stringify(source.lineFeature(rec)));
       n++;
     }
@@ -246,12 +278,13 @@ async function extractLines(dir, pbf, waysFile, id, source, owner) {
   return n;
 }
 
+
 /**
  * Polygons (buildings with a roof tag …) as <dir>/<id>.geojsonl: osmium tags-filter keeps the objects with the source's tags (first
  * `filter`, OR) that also have one of `require` (second filter, AND) plus what they refer to; osmium export assembles the areas
  * (closed ways and multipolygon relations). Offline per file, one pass each. Returns the number of features written.
  */
-async function extractPolygons(dir, pbf, id, source, owner) {
+async function extractPolygons(dir, pbf, id, source) {
   const tmp = join(dir, `polygons-tmp-${id}`);
   mkdirSync(tmp, { recursive: true });
   const [s1, s2, raw] = ['s1.osm.pbf', 's2.osm.pbf', 'areas.geojsonseq'].map((f) => join(tmp, f));
@@ -265,8 +298,6 @@ async function extractPolygons(dir, pbf, id, source, owner) {
   for await (const f of geojsonLines(raw)) {
     const feat = source.polygonFeature(f);
     if (!feat) continue;
-    const [x, y] = feat.geometry.coordinates[0][0][0]; // ownership: the first vertex
-    if (!owner(x, y)) continue;
     await out.write(JSON.stringify(feat));
     n++;
   }
@@ -275,22 +306,20 @@ async function extractPolygons(dir, pbf, id, source, owner) {
   return n;
 }
 
-const entries = (geometry) => Object.entries(THEMES).filter(([, s]) => s.geometry === geometry);
 
-/** downloads the extract (or takes the local file) and writes the intermediates of all sources of the registry */
-async function extract(key, outDir, { url, owner }) {
-  const dir = join(outDir, 'src', key);
+const entries = (geometry, groups) => Object.entries(THEMES).filter(([, s]) => s.geometry === geometry && groups.includes(s.group));
+
+/** writes the intermediates (GeoJSON lines per source) of the given groups to <outDir>/src/; `consume`: delete the planet after the last pass */
+
+async function extract(pbf, outDir, { groups, consume = false }) {
+  const key = 'osm';
+  const dir = join(outDir, 'src');
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  let pbf = url;
-  if (/^https?:/.test(url)) {
-    pbf = join(dir, 'region.osm.pbf');
-    console.log(`${key}: downloading ${url}`);
-    await download(url, pbf);
-  }
   const t0 = Date.now();
-  const points = entries('point'), lines = entries('line'), polygons = entries('polygon');
+  const points = entries('point', groups), lines = entries('line', groups), polygons = entries('polygon', groups);
   const counts = Object.fromEntries(Object.keys(THEMES).map((id) => [id, 0]));
+  const pass1 = async () => {
   // pass 1: nodes (points) and ways (their lines are built in pass 2), one streamed osmium run for all sources
   const filter = [...new Set([...points, ...lines].flatMap(([, s]) => s.filter))].join(' ');
   const proc = spawn('bash', ['-c', `set -o pipefail; osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - "${pbf}" ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
@@ -314,14 +343,14 @@ async function extract(key, outDir, { url, owner }) {
       continue;
     }
     const node = parseNode(line);
-    if (!node || !owner(node.x, node.y)) continue;
+    if (!node) continue;
     for (const [id, s] of points) {
       if (!s.match(node.tags)) continue;
       const rec = s.record(node);
       if (s.refine) deferred[id].set(node.id, rec);
       else {
         await out[id].write(JSON.stringify(toFeature(id, rec)));
-        if (++counts[id] % 100000 === 0) console.log(`${key}: ${counts[id]} ${id} so far (${Math.round((Date.now() - t0) / 1000)} s)`);
+        if (++counts[id] % 5_000_000 === 0) console.log(`${key}: ${counts[id]} ${id} so far (${Math.round((Date.now() - t0) / 1000)} s)`);
       }
     }
   }
@@ -338,83 +367,18 @@ async function extract(key, outDir, { url, owner }) {
     w.end();
     await once(w, 'finish');
   }
+  };
+  if (points.length || lines.length) await timed('pass 1: nodes and ways of the themes (stream through the filter)', pass1);
   for (const [id, s] of lines) {
-    counts[id] = await extractLines(dir, pbf, join(dir, `ways-${id}.opl`), id, s, owner);
+    counts[id] = await timed(`lines ${id}: second pass over the planet`, () => extractLines(dir, pbf, join(dir, `ways-${id}.opl`), id, s));
     rmSync(join(dir, `ways-${id}.opl`), { force: true });
   }
-  for (const [id, s] of polygons) counts[id] = await extractPolygons(dir, pbf, id, s, owner);
-  if (pbf !== url) rmSync(pbf, { force: true });
+  for (const [id, s] of polygons) counts[id] = await timed(`polygons ${id}: filter and export`, () => extractPolygons(dir, pbf, id, s));
+  if (consume) rmSync(pbf, { force: true }); // the last pass over the planet is done: the disk is needed for the rest
   console.log(`${key}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')} (${Math.round((Date.now() - t0) / 1000)} s)`);
   return counts;
 }
 
-/** the download retries itself (download()); on any other failure (osmium, a broken file) start the region over once (a job has 6 h) */
-async function extractWithRetry(key, outDir, opts, attempts = 2) {
-  for (let i = 1; ; i++) {
-    try {
-      return await extract(key, outDir, opts);
-    } catch (e) {
-      if (e instanceof GeofabrikUnreachable || i >= attempts) throw e; // unreachable: another runner has to try, not this one again
-      console.error(`${key}: attempt ${i}/${attempts} failed (${e.message}) – starting over in ${i * 60} s`);
-      await sleep(i * 60_000);
-    }
-  }
-}
-
-/** Content-Length of a URL (HEAD), pausing on 429/503 as the server asks */
-async function headSize(url) {
-  for (let i = 1; ; i++) {
-    const r = await fetch(url, { method: 'HEAD', redirect: 'follow', headers: { 'User-Agent': USER_AGENT } });
-    if (r.ok) return Number(r.headers.get('content-length'));
-    if ((r.status !== 429 && r.status < 500) || i >= 6) throw new Error(`HEAD ${url}: HTTP ${r.status}`);
-    await sleep(backoffMs(i, retryAfterSeconds(r.headers.get('retry-after'))));
-  }
-}
-
-/**
- * Fills the table of pbf sizes for exactly the nodes the unit selection looks at (from the top down until a region fits `max`), one HEAD request
- * every 1.5 s; sizes already in `sizes` are kept. Returns the table.
- */
-export async function probeSizes(index, sizes, max = UNIT_MAX_BYTES, head = headSize, pause = 1500) {
-  const out = { ...sizes };
-  const walk = async (n) => {
-    if (out[n.key] === undefined) {
-      out[n.key] = await head(n.url);
-      console.log(`${n.key}: ${(out[n.key] / 1e6).toFixed(0)} MB`);
-      await sleep(pause);
-    }
-    if (out[n.key] > max) for (const c of n.children) await walk(c);
-  };
-  for (const r of regionTree(index).roots) await walk(r);
-  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => (a < b ? -1 : 1)));
-}
-
-/** name of the state asset of a region: its upload time says when the region was built */
-export const stateAsset = (key) => `${key}.f${FORMAT}.points.tar`;
-/** name of the release asset of a group's regional piece (several files in the group: a tar, else the PMTiles itself) */
-export const assetName = (key, group) => `${key}.f${FORMAT}.${group}.${GROUPS[group].length > 1 ? 'tar' : 'pmtiles'}`;
-
-/** how many units a daily run refreshes: a 30th of all (rounded up), so every unit is due about every 30 days */
-// units without a piece of the current format (names = asset names of the release osm-src-points)
-export const missingUnits = (units, names, format = FORMAT) => {
-  const have = new Set(names.filter((n) => n.endsWith(`.f${format}.points.tar`)).map((n) => n.slice(0, -`.f${format}.points.tar`.length)));
-  return units.filter((u) => !have.has(u));
-};
-export const dailyCount = (n) => Math.ceil(n / MAX_AGE_DAYS);
-
-/** which units to refresh: `all` (the oldest MAX_ALL), the given one, or the oldest ones that are due (a 30th of all per run: rolling) */
-export function planRegions(assets, keys, arg, now = Date.now()) {
-  if (arg && arg !== 'all') {
-    if (!keys.includes(arg)) throw new Error(`unknown region ${arg}`);
-    return [arg];
-  }
-  const built = new Map(assets.map((a) => [a.name, Date.parse(a.updatedAt ?? a.updated_at)])); // gh api: updated_at, gh release view: updatedAt
-  const age = (k) => (built.has(stateAsset(k)) ? now - built.get(stateAsset(k)) : Infinity);
-  const byAge = [...keys].sort((a, b) => age(b) - age(a) || (a < b ? -1 : 1));
-  if (arg === 'all') return byAge.slice(0, MAX_ALL);
-  const due = byAge.filter((k) => age(k) > MAX_AGE_DAYS * 864e5);
-  return due.slice(0, dailyCount(keys.length));
-}
 
 /**
  * Attribute-free copy of the points for the low zooms: for each zoom z < LOW_ZOOM_END one point per LOW_GRID cell of a
@@ -469,58 +433,56 @@ async function heatCells(files) {
 
 const nonEmpty = (f) => existsSync(f) && statSync(f).size > 0;
 
-/** regional PMTiles: one per file of the registry from the intermediates of one region */
-async function buildRegional(srcDir, outDir) {
-  mkdirSync(outDir, { recursive: true });
+/** the group of a world file (all its sources share one) */
+const groupOf = (file) => sourcesOf(file)[0].group;
+
+/**
+ * World PMTiles of the groups from the intermediates in `srcDir`: <outDir>/<file>-<date>.pmtiles per file (+ heat/cctv.json). Returns the
+ * part of meta.json these files make: { files, sets, heatCells }.
+ */
+async function buildWorld(srcDir, outDir, groups, counts, date) {
+  mkdirSync(join(outDir, 'heat'), { recursive: true });
   const common = ['--force', '--read-parallel', '-q', '-A', ATTRIBUTION];
-  for (const file of FILES) {
+  const part = { files: {}, sets: {} };
+  for (const file of FILES.filter((f) => groups.includes(groupOf(f)))) {
     const sources = sourcesOf(file);
     const inputs = sources.map((s) => ({ ...s, path: join(srcDir, `${s.id}.geojsonl`) })).filter((s) => nonEmpty(s.path));
-    if (!inputs.length) continue;
-    const target = join(outDir, `${file}.pmtiles`);
-    const [zMin, zMax] = sources[0].zoom;
-    const name = ['-n', file, '-N', `OpenStreetMap ${file}`];
-    if (sources[0].low) {
-      // Camera sets: z0..LOW_ZOOM_END-1 only one bare point per grid cell (layer <set>_lo, lowZoomPoints), nothing dropped;
-      // from LOW_ZOOM_END the full records (layer <set>); tile-join puts both zoom ranges into one file
-      const lo = join(outDir, `${file}-lo`), hi = join(outDir, `${file}-hi`);
-      await lowZoomPoints(inputs.map((s) => s.path), file, `${lo}.geojsonl`);
-      await run('tippecanoe', ['-o', `${lo}.pmtiles`, '-l', `${file}_lo`, '-Z', '0', '-z', String(LOW_ZOOM_END - 1), '--no-feature-limit', '--no-tile-size-limit', '-r1', '-b', '0', ...name, ...common, `${lo}.geojsonl`]);
-      await run('tippecanoe', ['-o', `${hi}.pmtiles`, '-l', file, '-Z', String(LOW_ZOOM_END), '-z', String(zMax), ...sources[0].tippecanoe, ...name, ...common, ...inputs.map((s) => s.path)]);
-      await run('tile-join', ['-o', target, '--force', '-pk', '-q', ...name, '-A', ATTRIBUTION, `${lo}.pmtiles`, `${hi}.pmtiles`]);
-      for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${hi}.pmtiles`]) rmSync(f, { force: true });
-    } else {
-      // one file, one layer per source (-L name:file), all at the zoom of the file
-      await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), ...sources[0].tippecanoe, ...name, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
+    if (!inputs.length) {
+      console.log(`${file}: no data - skipped`);
+      continue;
     }
-    console.log(`${file}: ${statSync(target).size} bytes`);
+    const name = `${file}-${date}.pmtiles`;
+    const target = join(outDir, name);
+    const [zMin, zMax] = sources[0].zoom;
+    const label = ['-n', file, '-N', `OpenStreetMap ${file}`];
+    await timed(`tippecanoe ${file}`, async () => {
+      if (sources[0].low) {
+        // Camera sets: z0..LOW_ZOOM_END-1 only one bare point per grid cell (layer <set>_lo, lowZoomPoints), nothing dropped;
+        // from LOW_ZOOM_END the full records (layer <set>); tile-join puts both zoom ranges into one file
+        const lo = join(srcDir, `${file}-lo`), hi = join(srcDir, `${file}-hi`);
+        await lowZoomPoints(inputs.map((s) => s.path), file, `${lo}.geojsonl`);
+        await run('tippecanoe', ['-o', `${lo}.pmtiles`, '-l', `${file}_lo`, '-Z', '0', '-z', String(LOW_ZOOM_END - 1), '--no-feature-limit', '--no-tile-size-limit', '-r1', '-b', '0', ...label, ...common, `${lo}.geojsonl`]);
+        await run('tippecanoe', ['-o', `${hi}.pmtiles`, '-l', file, '-Z', String(LOW_ZOOM_END), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.map((s) => s.path)]);
+        await run('tile-join', ['-o', target, '--force', '-pk', '-q', ...label, '-A', ATTRIBUTION, `${lo}.pmtiles`, `${hi}.pmtiles`]);
+        for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${hi}.pmtiles`]) rmSync(f, { force: true });
+      } else {
+        // one file, one layer per source (-L name:file), all at the zoom of the file
+        await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
+      }
+    });
+    const features = counts[sources[0].id] ?? 0;
+    part.files[file] = name;
+    part.sets[file] = { bytes: statSync(target).size, features, ...(sources.length > 1 ? { layers: Object.fromEntries(sources.map((s) => [s.layer, counts[s.id] ?? 0])) } : {}) };
+    console.log(`${file}: ${part.sets[file].bytes} bytes, ${features} features`);
   }
   for (const [id, s] of Object.entries(THEMES)) {
-    if (!s.heat || !nonEmpty(join(srcDir, `${id}.geojsonl`))) continue;
-    writeFileSync(join(outDir, `heat-${id}.json`), JSON.stringify(await heatCells([join(srcDir, `${id}.geojsonl`)])));
+    if (!s.heat || !groups.includes(s.group) || !nonEmpty(join(srcDir, `${id}.geojsonl`))) continue;
+    const cells = await timed(`heat cells ${id}`, () => heatCells([join(srcDir, `${id}.geojsonl`)]));
+    writeFileSync(join(outDir, 'heat', `${id}.json`), JSON.stringify(cells));
+    part.heatCells = { ...part.heatCells, [id]: cells.length };
+    part.extra = { ...part.extra, [`heat/${id}.json`]: statSync(join(outDir, 'heat', `${id}.json`)).size };
   }
-  copyFileSync(join(srcDir, 'info.json'), join(outDir, 'info.json'));
-}
-
-/** the assets of one region for the GitHub releases: <upload>/<assetName> per group (several files: tar with info.json and heat files, state asset) */
-async function packageRegional(key, regionalDir, uploadDir) {
-  mkdirSync(uploadDir, { recursive: true });
-  const made = [];
-  for (const [group, files] of Object.entries(GROUPS)) {
-    const present = files.filter((f) => existsSync(join(regionalDir, `${f}.pmtiles`)));
-    const target = join(uploadDir, assetName(key, group));
-    if (files.length === 1) {
-      if (present.length) copyFileSync(join(regionalDir, `${files[0]}.pmtiles`), target);
-      else continue;
-    } else {
-      const members = [...present.map((f) => `${f}.pmtiles`), ...readdirSync(regionalDir).filter((f) => /^heat-.*\.json$/.test(f)), 'info.json'];
-      await run('tar', ['-cf', target, '-C', regionalDir, ...members]);
-    }
-    const bytes = statSync(target).size;
-    if (bytes > ASSET_MAX_BYTES) throw new Error(`${assetName(key, group)} is ${bytes} bytes: a release asset holds at most 2 GB, lower UNIT_MAX_BYTES`);
-    made.push({ group, asset: assetName(key, group), bytes });
-  }
-  return made;
+  return part;
 }
 
 /**
@@ -538,65 +500,45 @@ export function retireVersions(prev, files, now = Date.now(), ttl = CDN_TTL_MS) 
   return { retired: all.filter((r) => now - r.at < ttl), deletable: all.filter((r) => now - r.at >= ttl).map((r) => r.file) };
 }
 
-/** unpacks the regional assets in `dir` (current FORMAT only) into <regions>/<key>/<file>.pmtiles, heat-*.json, info.json; returns the keys */
-async function unpack(dir, regions, only = null) {
-  rmSync(regions, { recursive: true, force: true });
-  const names = readdirSync(dir);
-  const keys = names.filter((n) => n.endsWith(`.f${FORMAT}.points.tar`)).map((n) => n.slice(0, -`.f${FORMAT}.points.tar`.length)).filter((k) => !only || only.has(k)); // pieces of regions that are no unit (any more) would double the data
-  for (const key of keys) {
-    const rd = join(regions, key);
-    mkdirSync(rd, { recursive: true });
-    for (const [group, files] of Object.entries(GROUPS)) {
-      const asset = join(dir, assetName(key, group));
-      if (!existsSync(asset)) continue;
-      if (files.length > 1) await run('tar', ['-xf', asset, '-C', rd]);
-      else copyFileSync(asset, join(rd, `${files[0]}.pmtiles`));
-    }
+/** joins the part files of the jobs to meta.json (+ LICENSE.txt); the superseded versions go into meta.retired / the delete list */
+export function publish(partsDir, distDir, { prev, deleteList, manifest: manifestPath, date = new Date().toISOString().slice(0, 10), now = Date.now() } = {}) {
+  const parts = readdirSync(partsDir).filter((f) => f.endsWith('.json')).map((f) => readJson(join(partsDir, f)));
+  if (!parts.length) throw new Error(`no part files in ${partsDir}`);
+  const built = new Set(parts.flatMap((p) => p.groups ?? []));
+  const absent = Object.keys(GROUPS).filter((g) => !built.has(g));
+  if (absent.length) throw new Error(`no part for the groups ${absent.join(', ')}: publishing would drop their files from meta.json`);
+  const files = {}, sets = {};
+  let heatCells = 0;
+  for (const p of parts) {
+    Object.assign(files, p.files);
+    Object.assign(sets, p.sets);
+    heatCells += Object.values(p.heatCells ?? {}).reduce((a, b) => a + b, 0);
   }
-  return keys;
-}
-
-async function merge(assetsDir, distDir, { prev, deleteList, units = null, date = new Date().toISOString().slice(0, 10) }) {
-  const regionsDir = join(assetsDir, 'unpacked');
-  const keys = await unpack(assetsDir, regionsDir, units && new Set(units));
-  if (!keys.length) throw new Error(`no regional pieces of format ${FORMAT} in ${assetsDir}`);
-  mkdirSync(join(distDir, 'heat'), { recursive: true });
-  const infos = keys.map((k) => ({ key: k, ...JSON.parse(readFileSync(join(regionsDir, k, 'info.json'), 'utf8')) }));
-  console.log(`merging ${keys.length} regions`);
-  const meta = { format: FORMAT, at: Date.now(), version: date, files: {}, sets: {}, regions: keys.length, oldest: Math.min(...infos.map((i) => i.at)), newest: Math.max(...infos.map((i) => i.at)) };
-  for (const file of FILES) {
-    const inputs = keys.map((k) => join(regionsDir, k, `${file}.pmtiles`)).filter((f) => existsSync(f));
-    if (!inputs.length) {
-      console.log(`${file}: no data – skipped`);
-      continue;
-    }
-    const name = `${file}-${date}.pmtiles`;
-    const target = join(distDir, name);
-    // -pk: no tile size limit (the regional pieces were thinned already; the merge only concatenates the tiles of a seam)
-    await run('tile-join', ['-o', target, '--force', '-pk', '-q', '-n', file, '-N', `OpenStreetMap ${file}`, '-A', ATTRIBUTION, ...inputs]);
-    const sources = sourcesOf(file);
-    const sum = (id) => infos.reduce((a, i) => a + (i.counts?.[id] ?? 0), 0);
-    meta.files[file] = name;
-    meta.sets[file] = { bytes: statSync(target).size, features: sum(sources[0].id), ...(sources.length > 1 ? { layers: Object.fromEntries(sources.map((s) => [s.layer, sum(s.id)])) } : {}) };
-    console.log(`${file}: ${meta.sets[file].bytes} bytes from ${inputs.length} regions`);
-  }
-  // heatmap: cells of all regions (a cell on a seam is split between two regions: sum them)
-  const cells = new Map();
-  for (const k of keys) {
-    const f = join(regionsDir, k, 'heat-cctv.json');
-    if (!existsSync(f)) continue;
-    for (const [x, y, c] of JSON.parse(readFileSync(f, 'utf8'))) cells.set(`${x},${y}`, (cells.get(`${x},${y}`) ?? 0) + c);
-  }
-  const heat = [...cells].map(([k, c]) => [...k.split(',').map(Number), c]);
-  writeFileSync(join(distDir, 'heat', 'cctv.json'), JSON.stringify(heat));
-  meta.heatCells = heat.length;
-  const prevMeta = prev && existsSync(prev) ? JSON.parse(readFileSync(prev, 'utf8')) : null;
-  const { retired, deletable } = retireVersions(prevMeta, meta.files);
+  const dataAt = parts.map((p) => p.dataAt ?? now);
+  const meta = { format: FORMAT, at: now, version: date, files, sets, regions: 1, oldest: Math.min(...dataAt), newest: Math.max(...dataAt), heatCells };
+  const prevMeta = prev && existsSync(prev) ? readJson(prev) : null;
+  const { retired, deletable } = retireVersions(prevMeta, files, now);
   meta.retired = retired;
+  mkdirSync(distDir, { recursive: true });
   writeFileSync(join(distDir, 'meta.json'), JSON.stringify(meta));
   if (deleteList) writeFileSync(deleteList, deletable.join('\n') + (deletable.length ? '\n' : ''));
-  writeFileSync(join(distDir, 'LICENSE.txt'), 'Data © OpenStreetMap contributors, available under the Open Database License (ODbL) 1.0: https://opendatacommons.org/licenses/odbl/1-0/\nhttps://www.openstreetmap.org/copyright\nDerived from Geofabrik extracts (https://download.geofabrik.de).\n');
-  console.log(`heat/cctv.json: ${heat.length} cells; superseded: ${retired.length}, to delete now: ${deletable.length}`);
+  writeFileSync(join(distDir, 'LICENSE.txt'), 'Data © OpenStreetMap contributors, available under the Open Database License (ODbL) 1.0: https://opendatacommons.org/licenses/odbl/1-0/\nhttps://www.openstreetmap.org/copyright\nDerived from the OpenStreetMap planet file (https://planet.openstreetmap.org).\n');
+  if (manifestPath) {
+    // manifest.json of the bucket: entries of the new files (the build jobs upload without touching it: two jobs would overwrite each other), without the deleted ones
+    const m = existsSync(manifestPath) ? readJson(manifestPath) : {};
+    const add = (key, bytes) => {
+      const [, source = '', license = ''] = RULES.find(([re]) => re.test(key)) ?? [];
+      m[key] = { updated: new Date(now).toISOString(), bytes, source, license };
+    };
+    for (const [f, name] of Object.entries(files)) add(name, sets[f].bytes);
+    for (const p of parts) for (const [key, bytes] of Object.entries(p.extra ?? {})) add(key, bytes);
+    add('meta.json', statSync(join(distDir, 'meta.json')).size);
+    add('LICENSE.txt', statSync(join(distDir, 'LICENSE.txt')).size);
+    for (const f of deletable) delete m[f];
+    writeFileSync(manifestPath, JSON.stringify(Object.fromEntries(Object.entries(m).sort(([a], [b]) => (a < b ? -1 : 1)))));
+  }
+  console.log(`meta.json: ${Object.keys(files).length} files, ${heatCells} heat cells; superseded: ${retired.length}, to delete now: ${deletable.length}`);
+  return meta;
 }
 
 /** `--name value` pairs after the positional arguments */
@@ -610,71 +552,49 @@ function parseArgs(argv) {
 }
 
 const readJson = (f) => JSON.parse(readFileSync(f, 'utf8'));
-const loadSizes = () => (existsSync(SIZES_FILE) ? readJson(SIZES_FILE) : {});
 
-async function extractRegion(key, outDir, { url, owner }) {
-  const counts = await extractWithRetry(key, outDir, { url, owner });
-  writeFileSync(join(outDir, 'src', key, 'info.json'), JSON.stringify({ at: Date.now(), counts, format: FORMAT }));
-  return counts;
+/** time stamp of the planet's data (osmosis_replication_timestamp of the header) in ms, else now */
+function dataTimestamp(pbf) {
+  try {
+    const t = Date.parse(execFileSync('osmium', ['fileinfo', '-g', 'header.option.osmosis_replication_timestamp', pbf], { encoding: 'utf8' }).trim());
+    return Number.isNaN(t) ? Date.now() : t;
+  } catch {
+    return Date.now();
+  }
 }
 
-async function regionalRegion(key, outDir) {
-  const dir = join(outDir, 'regional', key);
-  await buildRegional(join(outDir, 'src', key), dir);
-  const made = await packageRegional(key, dir, join(outDir, 'upload'));
-  console.log(`${key}: ${made.map((m) => `${m.asset} (${m.bytes} B)`).join(', ')}`);
+async function build(opt) {
+  const groups = (opt.groups ?? Object.keys(GROUPS).join(',')).split(',');
+  for (const g of groups) if (!GROUPS[g]) throw new Error(`unknown group ${g} (${Object.keys(GROUPS).join(', ')})`);
+  const out = opt.out ?? 'work';
+  const date = opt.date ?? new Date().toISOString().slice(0, 10);
+  mkdirSync(out, { recursive: true });
+  let pbf = opt.pbf, consume = false;
+  if (!pbf) {
+    pbf = join(out, 'planet.osm.pbf');
+    consume = true;
+    const urls = process.env.PLANET_URL ? [process.env.PLANET_URL, ...PLANET_MIRRORS] : PLANET_MIRRORS;
+    const used = await timed('download of the planet', () => downloadFirst(urls, pbf));
+    console.log(`planet from ${used}: ${(statSync(pbf).size / 1e9).toFixed(1)} GB`);
+  }
+  const dataAt = dataTimestamp(pbf);
+  console.log(`planet data of ${new Date(dataAt).toISOString()}`);
+  const counts = await extract(pbf, out, { groups, consume });
+  const part = await buildWorld(join(out, 'src'), join(out, 'dist'), groups, counts, date);
+  writeFileSync(opt.part ?? join(out, 'part.json'), JSON.stringify({ ...part, groups, dataAt, counts }));
 }
 
 async function main() {
   const { pos, opt } = parseArgs(process.argv.slice(2));
   const [cmd, ...args] = pos;
-  if (cmd === 'plan') {
-    const [indexFile, assetsFile, arg] = args;
-    if (!indexFile || !assetsFile) throw new Error('usage: osm-tiles plan <index.json> <assets.json> [region|all]');
-    const keys = unitRegions(readJson(indexFile), loadSizes()).map((r) => r.key);
-    console.log(JSON.stringify(planRegions(readJson(assetsFile).assets ?? [], keys, arg)));
-  } else if (cmd === 'units') {
-    const [indexFile] = args;
-    if (!indexFile) throw new Error('usage: osm-tiles units <index.json>');
-    console.log(JSON.stringify(unitRegions(readJson(indexFile), loadSizes()).map((r) => r.key)));
-  } else if (cmd === 'coverage') {
-    const [unitsFile, namesFile] = args;
-    if (!unitsFile || !namesFile) throw new Error('usage: osm-tiles coverage <units.json> <asset-names.txt>   (prints {format,total,missing})');
-    const units = readJson(unitsFile);
-    const names = readFileSync(namesFile, 'utf8').split('\n').filter(Boolean);
-    console.log(JSON.stringify({ format: FORMAT, total: units.length, missing: missingUnits(units, names) }));
-  } else if (cmd === 'sizes') {
-    const [indexFile] = args;
-    if (!indexFile) throw new Error('usage: osm-tiles sizes <index.json> [--max bytes]   (updates collectors/osm-sizes.json)');
-    const sizes = await probeSizes(readJson(indexFile), loadSizes(), opt.max ? Number(opt.max) : UNIT_MAX_BYTES);
-    writeFileSync(SIZES_FILE, JSON.stringify(sizes, null, 0).replace(/,"/g, ',\n"').replace(/^\{/, '{\n').replace(/\}$/, '\n}') + '\n');
-  } else if (cmd === 'extract') {
-    const [outDir, key] = args;
-    if (!outDir || !key) throw new Error('usage: osm-tiles extract <outDir> <region> [--index f] [--url pbf] [--own-bbox w,s,e,n]');
-    const regions = opt.index ? unitRegions(readJson(opt.index), loadSizes()) : null;
-    const url = opt.url ?? findRegion(regions ?? [], key).url;
-    const owner = opt['own-bbox'] ? boxOwner(opt['own-bbox'].split(',').map(Number)) : regions && regions.some((r) => r.key === key) ? makeOwner(regions, key) : () => true;
-    await extractRegion(key, outDir, { url, owner });
-  } else if (cmd === 'regional') {
-    const [outDir, key] = args;
-    if (!outDir || !key) throw new Error('usage: osm-tiles regional <outDir> <region>');
-    await regionalRegion(key, outDir);
-  } else if (cmd === 'merge') {
-    const [assetsDir, distDir] = args;
-    if (!assetsDir || !distDir) throw new Error('usage: osm-tiles merge <assetsDir> <distDir> [--prev meta.json] [--delete-list f]');
-    await merge(assetsDir, distDir, { prev: opt.prev, deleteList: opt['delete-list'], units: opt.units ? readJson(opt.units) : null, date: opt.date });
-  } else if (cmd === 'local') {
-    const [workDir, ...specs] = args;
-    if (!workDir || !specs.length) throw new Error('usage: osm-tiles local <workDir> <key=pbf[@w,s,e,n]>...');
-    for (const spec of specs) {
-      const [key, rest] = spec.split('=');
-      const [url, box] = rest.split('@');
-      await extractRegion(key, workDir, { url, owner: box ? boxOwner(box.split(',').map(Number)) : () => true });
-      await regionalRegion(key, workDir);
-    }
-    await merge(join(workDir, 'upload'), join(workDir, 'dist'), { prev: opt.prev, deleteList: join(workDir, 'delete.txt'), date: opt.date });
+  if (cmd === 'build') {
+    await build(opt);
+  } else if (cmd === 'publish') {
+    const [partsDir, distDir] = args;
+    if (!partsDir || !distDir) throw new Error('usage: osm-tiles publish <partsDir> <distDir> [--prev meta.json] [--delete-list f] [--manifest manifest.json] [--date YYYY-MM-DD]');
+    publish(partsDir, distDir, { prev: opt.prev, deleteList: opt['delete-list'], manifest: opt.manifest, date: opt.date });
   } else {
-    throw new Error('usage: osm-tiles plan <index> <assets> [region|all] | units <index> | sizes <index> | extract <outDir> <region> | regional <outDir> <region> | merge <assetsDir> <distDir> | local <workDir> <key=pbf>...');
+    throw new Error('usage: osm-tiles build [--groups points,trees] [--out dir] [--pbf file] [--part file] [--date d] | publish <partsDir> <distDir> [--prev meta.json] [--delete-list f]');
   }
 }
 
@@ -692,7 +612,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     (e) => {
       finished = true;
       console.error(e.message);
-      process.exit(e instanceof GeofabrikUnreachable ? UNREACHABLE_EXIT : 1);
+      process.exit(1);
     },
   );
 }

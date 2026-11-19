@@ -1,11 +1,11 @@
-// Registry of the OSM themes of the osm-tiles pipeline (collectors/osm-tiles.mjs). A new theme is ONE entry in THEMES below:
+// Registry of the OSM themes of the osm-planet pipeline (collectors/osm-tiles.mjs). A new theme is ONE entry in THEMES below:
 // no new workflow, no new build code.
 //
 // An entry (a "source") says what is taken from OSM and how it is stored:
 //   file      name of the world PMTiles it goes into (<file>-<date>.pmtiles in the bucket); several sources may share a file
 //             (trees: layers `trees` and `tree_lines`)
 //   layer     layer name inside the file
-//   group     which GitHub release holds the regional pieces: osm-src-<group>; a group of several files is bundled as tar
+//   group     which job builds it (osm-planet.yml): points + trees = the node job, roofs = the roofs job (osmium needs the planet on disk for polygons)
 //   geometry  'point' (OSM nodes, streamed once), 'line' (ways: node refs from the stream, positions fetched in a second pass)
 //             or 'polygon' (buildings etc.: osmium export builds the areas)
 //   filter    osmium tags-filter expressions of the first pass (OR); polygons additionally `require` (AND, second filter)

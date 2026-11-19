@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, missingUnits, retryAfterSeconds, backoffMs, probeSizes, download, GeofabrikUnreachable, UNREACHABLE_EXIT } from './osm-tiles.mjs';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS } from './osm-tiles.mjs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import sizesTable from './osm-sizes.json';
 
 describe('trees set', () => {
   it('parses metre values and drops junk', () => {
@@ -96,11 +95,9 @@ describe('registry', () => {
     }
   });
 
-  it('roofs and trees are z15 only, each group is one release', () => {
+  it('roofs and trees are z15 only, the groups are the units of the two jobs', () => {
     expect(THEMES.roofs.zoom).toEqual([15, 15]);
     expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'], trees: ['trees'], roofs: ['roofs'] });
-    expect(assetName('europe_germany_hessen', 'points')).toBe(`europe_germany_hessen.f${FORMAT}.points.tar`);
-    expect(assetName('europe_germany_hessen', 'roofs')).toBe(`europe_germany_hessen.f${FORMAT}.roofs.pmtiles`);
   });
 });
 
@@ -117,47 +114,6 @@ describe('roofs theme', () => {
     expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { 'building:part': 'yes', 'building:levels': '3' } })).toBeNull();
     expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { amenity: 'shelter', 'roof:shape': 'flat' } })).toBeNull();
     expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { 'building:part': 'yes', 'roof:levels': '1' } })).not.toBeNull();
-  });
-});
-
-describe('plan', () => {
-  const keys = Array.from({ length: 60 }, (_, i) => `r${String(i).padStart(2, '0')}`);
-  const now = Date.parse('2026-12-01T00:00:00Z');
-  const asset = (k: string, daysAgo: number) => ({ name: stateAsset(k), updatedAt: new Date(now - daysAgo * 864e5).toISOString() });
-
-  it('rolling: the oldest due regions, a 30th of all per run', () => {
-    const assets = keys.map((k, i) => asset(k, 10 + i)); // r59 oldest (69 d)
-    expect(planRegions(assets, keys, undefined, now)).toEqual(['r59', 'r58']);
-  });
-
-  it('never built counts as oldest, regions younger than 30 days are not due', () => {
-    expect(planRegions(keys.slice(1).map((k) => asset(k, 5)), keys, undefined, now)).toEqual(['r00']);
-    expect(planRegions(keys.map((k) => asset(k, 29)), keys, undefined, now)).toEqual([]);
-  });
-
-  it('an asset of an older format does not count', () => {
-    expect(planRegions([{ name: `r00.f${FORMAT - 1}.points.tar`, updatedAt: new Date(now).toISOString() }], ['r00'], undefined, now)).toEqual(['r00']);
-  });
-
-  it('one region or all (oldest first, at most one matrix)', () => {
-    expect(planRegions([], keys, 'r07', now)).toEqual(['r07']);
-    expect(() => planRegions([], keys, 'nope', now)).toThrow();
-    expect(planRegions([], keys, 'all', now)).toHaveLength(40); // a batch; the oldest first
-    expect(planRegions([], Array.from({ length: 400 }, (_, i) => `k${i}`), 'all', now)).toHaveLength(40);
-    expect(planRegions(keys.slice(5).map((k) => asset(k, 5)), keys, 'all', now).slice(0, 5)).toEqual(['r00', 'r01', 'r02', 'r03', 'r04']);
-  });
-
-  it('a daily run stays small: about every 30 days each unit', () => {
-    expect(dailyCount(90)).toBe(3);
-    expect(dailyCount(91)).toBe(4);
-  });
-
-  it('missingUnits: only pieces of the current format count', () => {
-    const names = [`a.f${FORMAT}.points.tar`, `b.f${FORMAT - 1}.points.tar`, `c.f${FORMAT}.roofs.pmtiles`, `d.f${FORMAT}.points.tar`];
-    expect(missingUnits(['a', 'b', 'c', 'd'], names)).toEqual(['b', 'c']);
-    expect(missingUnits(['a'], [])).toEqual(['a']);
-    expect(missingUnits([], names)).toEqual([]);
-    expect(dailyCount(1)).toBe(1);
   });
 });
 
@@ -183,126 +139,6 @@ describe('retired versions', () => {
   });
 });
 
-describe('regions', () => {
-  const sq = (x: number, y: number, w: number) => ({ type: 'Polygon', coordinates: [[[x, y], [x + w, y], [x + w, y + w], [x, y + w], [x, y]]] });
-  const feat = (id: string, parent: string | undefined, path: string, geometry: unknown) => ({ type: 'Feature', geometry, properties: { id, parent, urls: { pbf: `https://download.geofabrik.de/${path}-latest.osm.pbf` } } });
-  const index = { features: [
-    feat('europe', undefined, 'europe', sq(0, 0, 40)),
-    feat('germany', 'europe', 'europe/germany', sq(0, 0, 20)),
-    feat('brandenburg', 'germany', 'europe/germany/brandenburg', sq(0, 0, 10)),
-    feat('berlin', 'germany', 'europe/germany/berlin', sq(4, 4, 2)),
-    feat('hessen', 'germany', 'europe/germany/hessen', sq(10, 0, 10)),
-    feat('dach', 'europe', 'europe/dach', sq(0, 0, 25)),
-  ] };
-
-  it('leaves of the index, no collective extracts, unique keys', () => {
-    const r = leafRegions(index);
-    expect(r.map((x: { key: string }) => x.key)).toEqual(['europe_germany_brandenburg', 'europe_germany_berlin', 'europe_germany_hessen']);
-    expect(regionKey('https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf')).toBe('north-america_us_new-york');
-  });
-
-  it('ownership: a seam point belongs to one region, Berlin is cut out of Brandenburg', () => {
-    const regions = leafRegions(index);
-    const bb = makeOwner(regions, 'europe_germany_brandenburg'), be = makeOwner(regions, 'europe_germany_berlin'), he = makeOwner(regions, 'europe_germany_hessen');
-    expect([bb(5, 5.5), be(5, 5.5)]).toEqual([false, true]); // in Berlin
-    expect([bb(2, 2), be(2, 2), he(2, 2)]).toEqual([true, false, false]);
-    expect([bb(12, 2), he(12, 2)]).toEqual([false, true]);
-    expect(bb(30, 30) || he(30, 30)).toBe(false);
-  });
-});
-
-describe('units', () => {
-  const sq = (x: number, y: number, w: number, h = w) => ({ type: 'Polygon', coordinates: [[[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]] });
-  const feat = (id: string, path: string, geometry: unknown) => ({ type: 'Feature', geometry, properties: { id, urls: { pbf: `https://download.geofabrik.de/${path}-latest.osm.pbf` } } });
-  // europe 0..30 > germany 0..20 > { brandenburg 0..10 (contains berlin 4..6), berlin, hessen 10..20 }, poland 20..30; us aggregate with a state below it
-  const index = { features: [
-    feat('europe', 'europe', sq(0, 0, 30, 10)),
-    feat('germany', 'europe/germany', sq(0, 0, 20, 10)),
-    feat('brandenburg', 'europe/germany/brandenburg', sq(0, 0, 10)),
-    feat('berlin', 'europe/germany/berlin', sq(4, 4, 2)),
-    feat('hessen', 'europe/germany/hessen', sq(10, 0, 10)),
-    feat('poland', 'europe/poland', sq(20, 0, 10)),
-    feat('dach', 'europe/dach', sq(0, 0, 25)),
-    feat('us', 'north-america/us', sq(100, 0, 30)),
-    feat('us/ohio', 'north-america/us/ohio', sq(100, 0, 10)),
-  ] };
-  const GB = 1e9;
-  const keysOf = (sizes: Record<string, number>, max = 3 * GB) => unitRegions(index, sizes, max).map((r: { key: string }) => r.key);
-
-  it('the tree is by path, collective extracts are no nodes (their children become roots)', () => {
-    const t = regionTree(index);
-    expect(t.roots.map((n: { key: string }) => n.key)).toEqual(['europe', 'north-america_us_ohio']);
-    expect(t.nodes.get('europe_germany').children.map((n: { key: string }) => n.key)).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen']);
-    expect(t.nodes.has('europe_dach')).toBe(false);
-  });
-
-  it('below a collective extract the nearest ancestor is the parent: a unit north-america covers the states', () => {
-    const idx2 = { features: [
-      feat('north-america', 'north-america', sq(100, 0, 40, 10)),
-      feat('us', 'north-america/us', sq(100, 0, 30, 10)),
-      feat('us/ohio', 'north-america/us/ohio', sq(100, 0, 10)),
-      feat('canada', 'north-america/canada', sq(130, 0, 10)),
-    ] };
-    expect(regionTree(idx2).roots.map((n: { key: string }) => n.key)).toEqual(['north-america']);
-    const keys = (sizes: Record<string, number>) => unitRegions(idx2, sizes, 20 * GB).map((r: { key: string }) => r.key);
-    expect(keys({ 'north-america': 19 * GB })).toEqual(['north-america']);
-    expect(keys({ 'north-america': 21 * GB })).toEqual(['north-america_canada', 'north-america_us_ohio']);
-  });
-
-  it('threshold: the biggest region that fits is one unit, bigger ones are split', () => {
-    const sizes = { europe: 30 * GB, europe_germany: 4 * GB, europe_germany_berlin: 0.1 * GB, europe_germany_brandenburg: 0.3 * GB, europe_germany_hessen: 0.4 * GB, europe_poland: 1.5 * GB };
-    expect(keysOf(sizes)).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen', 'europe_poland', 'north-america_us_ohio']);
-    expect(keysOf({ ...sizes, europe_germany: 2.9 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // fits: its children are not units
-    expect(keysOf({ ...sizes, europe_germany: 3 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // exactly the limit still fits
-    expect(keysOf({ ...sizes, europe: 3 * GB })).toEqual(['europe', 'north-america_us_ohio']);
-    expect(UNIT_MAX_BYTES).toBe(20 * GB);
-  });
-
-  it('unknown sizes: a region with children is split (safe), a leaf is a unit', () => {
-    expect(keysOf({})).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen', 'europe_poland', 'north-america_us_ohio']);
-  });
-
-  it('every point of the leaves is owned by exactly one unit, whatever the split (no gaps, no doublings)', () => {
-    const leaves = leafRegions(index);
-    const inLeaf = (x: number, y: number) => leaves.some((l: { bbox: number[] }) => x >= l.bbox[0] && x < l.bbox[2] && y >= l.bbox[1] && y < l.bbox[3]);
-    const splits = [
-      {},
-      { europe: 30 * GB, europe_germany: 4 * GB },
-      { europe: 2 * GB },
-      { europe: 30 * GB, europe_germany: 2 * GB, europe_poland: 1 * GB },
-      { europe: 30 * GB, europe_germany: 4 * GB, europe_germany_brandenburg: 1 * GB, europe_germany_hessen: 1 * GB },
-    ];
-    for (const sizes of splits) {
-      const units = unitRegions(index, sizes);
-      const owners = units.map((u: { key: string }) => makeOwner(units, u.key));
-      for (let x = 100.25; x < 130; x += 0.5) for (let y = 0.25; y < 20; y += 0.5) { // US: nothing but the state is a leaf, the aggregate us is no unit
-        expect(owners.filter((o: (x: number, y: number) => boolean) => o(x, y)).length).toBe(inLeaf(x, y) ? 1 : 0);
-      }
-      for (let x = 0.25; x < 35; x += 0.5) {
-        for (let y = 0.25; y < 12; y += 0.5) {
-          const n = owners.filter((o: (x: number, y: number) => boolean) => o(x, y)).length;
-          expect(n, `${JSON.stringify(sizes)} at ${x},${y}`).toBe(inLeaf(x, y) ? 1 : 0);
-        }
-      }
-    }
-  });
-
-  it('a seam of units keeps Berlin out of Brandenburg even when Germany is one unit', () => {
-    const units = unitRegions(index, { europe: 30 * GB, europe_germany: 2 * GB });
-    expect(units.map((u: { key: string }) => u.key)).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']);
-    const de = makeOwner(units, 'europe_germany');
-    expect(de(5, 5)).toBe(true); // Berlin lies inside germany, which has no separate unit for it
-    expect(de(25, 5)).toBe(false); // Poland
-  });
-
-  it('the committed size table: positive byte counts, keys of the index layout', () => {
-    for (const [k, v] of Object.entries(sizesTable as Record<string, number>)) {
-      expect(k).toMatch(/^[a-z0-9-]+(_[a-z0-9-]+)*$/);
-      expect(v).toBeGreaterThan(0);
-    }
-  });
-});
-
 describe('download pauses', () => {
   it('Retry-After as seconds or date', () => {
     expect(retryAfterSeconds('120')).toBe(120);
@@ -317,18 +153,6 @@ describe('download pauses', () => {
     expect(backoffMs(1)).toBeGreaterThanOrEqual(30_000);
     expect(backoffMs(3)).toBeGreaterThanOrEqual(120_000);
     expect(backoffMs(20)).toBeLessThanOrEqual(750_000);
-  });
-
-  it('the size probe only asks what the selection needs and keeps known sizes', async () => {
-    const idx = { features: [
-      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'a', urls: { pbf: 'https://download.geofabrik.de/a-latest.osm.pbf' } } },
-      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'b', urls: { pbf: 'https://download.geofabrik.de/a/b-latest.osm.pbf' } } },
-      { geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] }, properties: { id: 'c', urls: { pbf: 'https://download.geofabrik.de/c-latest.osm.pbf' } } },
-    ] };
-    const asked: string[] = [];
-    const sizes = await probeSizes(idx, { a: 9e9 }, 3e9, async (url: string) => { asked.push(url); return url.includes('/c-') ? 1e9 : 2e9; }, 0);
-    expect(sizes).toEqual({ a: 9e9, a_b: 2e9, c: 1e9 });
-    expect(asked).toHaveLength(2);
   });
 });
 
@@ -348,12 +172,11 @@ describe('download without a connection', () => {
   };
   const calls = (dir: string) => readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n').length;
 
-  it('curl exit 7: gives up after 3 tries with GeofabrikUnreachable (exit code 75 in main)', async () => {
+  it('curl exit 7: gives up after 3 tries with MirrorUnreachable (downloadFirst then takes the next mirror)', async () => {
     await withFakeCurl('exit 7', async (dir) => {
-      await expect(download('https://download.geofabrik.de/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] })).rejects.toBeInstanceOf(GeofabrikUnreachable);
+      await expect(download('https://planet.example/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] })).rejects.toBeInstanceOf(MirrorUnreachable);
       expect(calls(dir)).toBe(3);
     });
-    expect(UNREACHABLE_EXIT).toBe(75);
   });
 
   it('an HTTP answer (429 with Retry-After) is not "unreachable": it retries with the pause and then succeeds', async () => {
@@ -363,9 +186,90 @@ hdr=""; out=""; while [ $# -gt 0 ]; do case "$1" in -D) hdr=$2; shift;; -o) out=
 if [ "$n" -lt 2 ]; then printf 'HTTP/2 429\r\nretry-after: 0\r\n\r\n' > "$hdr"; exit 22; fi
 printf 'HTTP/2 200\r\n\r\n' > "$hdr"; echo data > "$out"`;
     await withFakeCurl(script, async (dir) => {
-      await download('https://download.geofabrik.de/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] });
+      await download('https://planet.example/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] });
       expect(calls(dir)).toBe(2);
       expect(readFileSync(join(dir, 'x.pbf'), 'utf8')).toBe('data\n');
     });
+  });
+});
+
+describe('mirrors', () => {
+  it('the first mirror that works is used; a partial file of a failed one is removed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-mirror-'));
+    const file = join(dir, 'planet.pbf');
+    const seen: string[] = [];
+    const used = await downloadFirst(['https://a/', 'https://b/', 'https://c/'], file, async (url: string, f: string) => {
+      seen.push(`${url}:${existsSync(f)}`);
+      if (url === 'https://a/') {
+        writeFileSync(f, 'partial');
+        throw new Error('stalled');
+      }
+      writeFileSync(f, 'planet');
+    });
+    expect(used).toBe('https://b/');
+    expect(seen).toEqual(['https://a/:false', 'https://b/:false']); // b did not resume the file of a
+    expect(readFileSync(file, 'utf8')).toBe('planet');
+  });
+
+  it('all mirrors failing throws the last error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-mirror-'));
+    await expect(downloadFirst(['https://a/', 'https://b/'], join(dir, 'p'), async (url: string) => { throw new Error(`down ${url}`); })).rejects.toThrow('down https://b/');
+  });
+
+  it('gwdg is first (fastest measured), the planet server is among the fallbacks', () => {
+    expect(PLANET_MIRRORS[0]).toContain('gwdg');
+    expect(PLANET_MIRRORS.some((u) => u.includes('planet.openstreetmap.org/pbf'))).toBe(true);
+  });
+});
+
+describe('publish', () => {
+  const t0 = Date.parse('2026-12-02T03:00:00Z');
+  const write = (dir: string, name: string, part: object) => writeFileSync(join(dir, name), JSON.stringify(part));
+  const parts = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-parts-'));
+    write(dir, 'nodes.json', { groups: ['points', 'trees'], dataAt: t0 - 3600e3, files: { cctv: 'cctv-2026-12-02.pmtiles', trees: 'trees-2026-12-02.pmtiles' }, sets: { cctv: { bytes: 5, features: 2 }, trees: { bytes: 7, features: 3 } }, heatCells: { cctv: 4 } });
+    write(dir, 'roofs.json', { groups: ['roofs'], dataAt: t0 - 7200e3, files: { roofs: 'roofs-2026-12-02.pmtiles' }, sets: { roofs: { bytes: 9, features: 1 } } });
+    return dir;
+  };
+
+  it('joins the parts of both jobs to one meta.json', () => {
+    const out = mkdtempSync(join(tmpdir(), 'osm-dist-'));
+    const meta = publish(parts(), out, { date: '2026-12-02', now: t0 });
+    expect(Object.keys(meta.files).sort()).toEqual(['cctv', 'roofs', 'trees']);
+    expect(meta.sets.roofs.bytes).toBe(9);
+    expect(meta.heatCells).toBe(4);
+    expect(meta.oldest).toBe(t0 - 7200e3);
+    expect(meta.newest).toBe(t0 - 3600e3);
+    expect(JSON.parse(readFileSync(join(out, 'meta.json'), 'utf8')).version).toBe('2026-12-02');
+    expect(existsSync(join(out, 'LICENSE.txt'))).toBe(true);
+  });
+
+  it('refuses to publish when a job delivered nothing (its files would vanish from meta.json)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-parts-'));
+    write(dir, 'roofs.json', { groups: ['roofs'], files: { roofs: 'roofs-2026-12-02.pmtiles' }, sets: {} });
+    expect(() => publish(dir, mkdtempSync(join(tmpdir(), 'osm-dist-')), { now: t0 })).toThrow(/points/);
+  });
+
+  it('the superseded versions are retired, deleted after the cache time', () => {
+    const prev = join(mkdtempSync(join(tmpdir(), 'osm-prev-')), 'meta.json');
+    writeFileSync(prev, JSON.stringify({ files: { cctv: 'cctv-2026-11-02.pmtiles' }, retired: [{ file: 'old.pmtiles', at: t0 - 48 * 3600e3 }] }));
+    const out = mkdtempSync(join(tmpdir(), 'osm-dist-'));
+    const list = join(out, 'delete.txt');
+    const meta = publish(parts(), out, { prev, deleteList: list, now: t0 });
+    expect(meta.retired.map((r: { file: string }) => r.file)).toEqual(['cctv-2026-11-02.pmtiles']);
+    expect(readFileSync(list, 'utf8')).toBe('old.pmtiles\n');
+  });
+
+  it('updates the bucket manifest: new files in (with source and licence), deleted ones out, the rest stays', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-man-'));
+    const manifest = join(dir, 'manifest.json');
+    writeFileSync(manifest, JSON.stringify({ 'other.json': { updated: 'x', bytes: 1, source: 's', license: 'l' }, 'old.pmtiles': { updated: 'x', bytes: 2, source: '', license: '' } }));
+    const prev = join(dir, 'prev.json');
+    writeFileSync(prev, JSON.stringify({ files: {}, retired: [{ file: 'old.pmtiles', at: t0 - 48 * 3600e3 }] }));
+    publish(parts(), join(dir, 'dist'), { prev, manifest, now: t0 });
+    const m = JSON.parse(readFileSync(manifest, 'utf8'));
+    expect(Object.keys(m)).toEqual(expect.arrayContaining(['cctv-2026-12-02.pmtiles', 'roofs-2026-12-02.pmtiles', 'meta.json', 'LICENSE.txt', 'other.json']));
+    expect(m['roofs-2026-12-02.pmtiles']).toMatchObject({ bytes: 9, license: expect.stringContaining('ODbL') });
+    expect(m['old.pmtiles']).toBeUndefined();
   });
 });

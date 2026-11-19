@@ -49,7 +49,7 @@ export const RULES = [
   [/^aircraft\/opensky-states\.json$/, 'https://opensky-network.org/api/states/all?extended=1 (central fetch every 90 s, collectors/opensky-loop.mjs)', 'OpenSky Network, free for research and non-commercial use, attribution (Schäfer et al., IPSN 2014); terms: https://opensky-network.org/about/terms-of-use'],
   [/^meta\.json$/, 'Orbismap/data collectors', 'n/a'],
   // orbis-osm
-  [/^((cctv|blitzer|alpr|webcam|wind|resource|trees|roofs)(-\d{4}-\d{2}-\d{2})?\.pmtiles|heat\/)/, 'OpenStreetMap, Geofabrik extracts (https://download.geofabrik.de)', ODBL],
+  [/^((cctv|blitzer|alpr|webcam|wind|resource|trees|roofs)(-\d{4}-\d{2}-\d{2})?\.pmtiles|heat\/)/, 'OpenStreetMap planet file (https://planet.openstreetmap.org)', ODBL],
   // orbis-wetter
   [/^v1\/static\/dem\//, 'Mapzen Terrain Tiles / Terrarium z5 (https://registry.opendata.aws/terrain-tiles; SRTM, GMTED2010, ETOPO1 u. a., https://github.com/tilezen/joerd/blob/master/docs/attribution.md), resampled to 0.5 deg / 0.125 deg OWX (collectors/wetter-dem.py)', 'AWS Open Data terrain tiles, free use with attribution of the underlying sources (SRTM/NASA public domain, GMTED2010/USGS public domain, ETOPO1/NOAA public domain)'],
   [/^LICENSE\.txt$/, 'Orbismap/data collectors', ODBL],
