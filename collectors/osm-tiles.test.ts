@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS } from './osm-tiles.mjs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 describe('trees set', () => {
   it('parses metre values and drops junk', () => {
@@ -69,5 +72,204 @@ describe('tree_lines layer', () => {
 
   it('has its own layer and intermediate in the trees file', () => {
     expect(LINES).toMatchObject({ set: 'trees', layer: 'tree_lines' });
+  });
+});
+
+describe('registry', () => {
+  it('keeps the files, layers and fields the client reads', () => {
+    expect(SETS).toEqual(['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'trees']);
+    expect(FILES).toEqual([...SETS, 'roofs']);
+    expect(FIELDS.cctv).toEqual(['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id']);
+    expect(FIELDS.blitzer).toEqual(['dir', 'kind', 'speed', 'operator', 'ref', 'id']);
+    expect(FIELDS.resource).toEqual(['name', 'kind', 'words', 'resource', 'operator', 'id']);
+    expect(THEMES.trees.layer).toBe('trees');
+    expect(THEMES.tree_lines).toMatchObject({ file: 'trees', layer: 'tree_lines' });
+  });
+
+  it('every source has what its geometry needs', () => {
+    for (const [id, s] of Object.entries(THEMES)) {
+      expect(s.file && s.layer && s.group && s.filter?.length && s.zoom, id).toBeTruthy();
+      if (s.geometry === 'point') expect(typeof s.match === 'function' && typeof s.record === 'function' && s.fields?.length, id).toBeTruthy();
+      if (s.geometry === 'line') expect(typeof s.lineRecord === 'function' && typeof s.match === 'function', id).toBeTruthy();
+      if (s.geometry === 'polygon') expect(typeof s.polygonFeature === 'function' && s.require?.length, id).toBeTruthy();
+    }
+  });
+
+  it('roofs and trees are z15 only, the groups are the units of the two jobs', () => {
+    expect(THEMES.roofs.zoom).toEqual([15, 15]);
+    expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'], trees: ['trees'], roofs: ['roofs'] });
+  });
+});
+
+describe('roofs theme', () => {
+  const poly = [[[8, 50], [8.0001, 50], [8.0001, 50.0001], [8, 50]]];
+  it('keeps the tags the 3D model reads, under the OSM keys, and nothing else', () => {
+    const f = roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { building: 'house', 'roof:shape': ' Gabled ', 'roof:height': '3.5', 'addr:city': 'X', name: 'Y', height: '9' } });
+    expect(f!.properties).toEqual({ building: 'house', 'roof:shape': 'gabled', 'roof:height': '3.5', height: '9' });
+    expect(f!.geometry.type).toBe('MultiPolygon');
+  });
+
+  it('drops buildings and parts without a roof tag, and roof tags without a building', () => {
+    expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { building: 'house', height: '9' } })).toBeNull();
+    expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { 'building:part': 'yes', 'building:levels': '3' } })).toBeNull();
+    expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { amenity: 'shelter', 'roof:shape': 'flat' } })).toBeNull();
+    expect(roofFeature({ type: 'Feature', geometry: { type: 'Polygon', coordinates: poly }, properties: { 'building:part': 'yes', 'roof:levels': '1' } })).not.toBeNull();
+  });
+});
+
+describe('retired versions', () => {
+  const files = { cctv: 'cctv-2026-12-02.pmtiles', roofs: 'roofs-2026-12-02.pmtiles' };
+  const t0 = Date.parse('2026-12-02T03:00:00Z');
+  const H = 3600e3;
+
+  it('a replaced version waits for the cache time, then it is deleted', () => {
+    const prev = { files: { cctv: 'cctv-2026-12-01.pmtiles', roofs: 'roofs-2026-12-01.pmtiles' }, retired: [] };
+    const first = retireVersions(prev, files, t0);
+    expect(first.deletable).toEqual([]);
+    expect(first.retired.map((r) => r.file)).toEqual(['cctv-2026-12-01.pmtiles', 'roofs-2026-12-01.pmtiles']);
+    const second = retireVersions({ files, retired: first.retired }, { cctv: 'cctv-2026-12-03.pmtiles', roofs: 'roofs-2026-12-03.pmtiles' }, t0 + 25 * H);
+    expect(second.deletable.sort()).toEqual(['cctv-2026-12-01.pmtiles', 'roofs-2026-12-01.pmtiles']);
+    expect(second.retired.map((r) => r.file).sort()).toEqual(['cctv-2026-12-02.pmtiles', 'roofs-2026-12-02.pmtiles']);
+  });
+
+  it('the same version again is not retired; the unversioned names of the old layout are', () => {
+    expect(retireVersions({ files, retired: [] }, files, t0)).toEqual({ retired: [], deletable: [] });
+    expect(retireVersions({ sets: { cctv: {}, trees: {} } }, files, t0).retired.map((r) => r.file)).toEqual(['cctv.pmtiles', 'trees.pmtiles']);
+    expect(retireVersions(null, files, t0)).toEqual({ retired: [], deletable: [] });
+  });
+});
+
+describe('download pauses', () => {
+  it('Retry-After as seconds or date', () => {
+    expect(retryAfterSeconds('120')).toBe(120);
+    expect(retryAfterSeconds('Wed, 21 Oct 2026 07:28:00 GMT', Date.parse('2026-10-21T07:26:00Z'))).toBe(120);
+    expect(retryAfterSeconds(null)).toBeNull();
+    expect(retryAfterSeconds('soon')).toBeNull();
+  });
+
+  it('the server\'s pause is respected, else growing up to 10 minutes (plus at most 25 % jitter)', () => {
+    expect(backoffMs(1, 120)).toBeGreaterThanOrEqual(120_000);
+    expect(backoffMs(1, 120)).toBeLessThanOrEqual(150_000);
+    expect(backoffMs(1)).toBeGreaterThanOrEqual(30_000);
+    expect(backoffMs(3)).toBeGreaterThanOrEqual(120_000);
+    expect(backoffMs(20)).toBeLessThanOrEqual(750_000);
+  });
+});
+
+describe('download without a connection', () => {
+  // a fake curl first on the PATH: counts its calls and fails like curl does when the TCP connection is refused (exit 7)
+  const withFakeCurl = async (script: string, fn: (dir: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-curl-'));
+    writeFileSync(join(dir, 'curl'), `#!/bin/bash\necho x >> "${dir}/calls"\n${script}\n`);
+    chmodSync(join(dir, 'curl'), 0o755);
+    const path = process.env.PATH;
+    process.env.PATH = `${dir}:${path}`;
+    try {
+      await fn(dir);
+    } finally {
+      process.env.PATH = path;
+    }
+  };
+  const calls = (dir: string) => readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n').length;
+
+  it('curl exit 7: gives up after 3 tries with MirrorUnreachable (downloadFirst then takes the next mirror)', async () => {
+    await withFakeCurl('exit 7', async (dir) => {
+      await expect(download('https://planet.example/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] })).rejects.toBeInstanceOf(MirrorUnreachable);
+      expect(calls(dir)).toBe(3);
+    });
+  });
+
+  it('an HTTP answer (429 with Retry-After) is not "unreachable": it retries with the pause and then succeeds', async () => {
+    // 1st call: 429 + exit 22 (--fail); 2nd call: 200 and a file
+    const script = `n=$(wc -l < "$(dirname "$0")/calls")
+hdr=""; out=""; while [ $# -gt 0 ]; do case "$1" in -D) hdr=$2; shift;; -o) out=$2; shift;; esac; shift; done
+if [ "$n" -lt 2 ]; then printf 'HTTP/2 429\r\nretry-after: 0\r\n\r\n' > "$hdr"; exit 22; fi
+printf 'HTTP/2 200\r\n\r\n' > "$hdr"; echo data > "$out"`;
+    await withFakeCurl(script, async (dir) => {
+      await download('https://planet.example/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] });
+      expect(calls(dir)).toBe(2);
+      expect(readFileSync(join(dir, 'x.pbf'), 'utf8')).toBe('data\n');
+    });
+  });
+});
+
+describe('mirrors', () => {
+  it('the first mirror that works is used; a partial file of a failed one is removed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-mirror-'));
+    const file = join(dir, 'planet.pbf');
+    const seen: string[] = [];
+    const used = await downloadFirst(['https://a/', 'https://b/', 'https://c/'], file, async (url: string, f: string) => {
+      seen.push(`${url}:${existsSync(f)}`);
+      if (url === 'https://a/') {
+        writeFileSync(f, 'partial');
+        throw new Error('stalled');
+      }
+      writeFileSync(f, 'planet');
+    });
+    expect(used).toBe('https://b/');
+    expect(seen).toEqual(['https://a/:false', 'https://b/:false']); // b did not resume the file of a
+    expect(readFileSync(file, 'utf8')).toBe('planet');
+  });
+
+  it('all mirrors failing throws the last error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-mirror-'));
+    await expect(downloadFirst(['https://a/', 'https://b/'], join(dir, 'p'), async (url: string) => { throw new Error(`down ${url}`); })).rejects.toThrow('down https://b/');
+  });
+
+  it('gwdg is first (fastest measured), the planet server is among the fallbacks', () => {
+    expect(PLANET_MIRRORS[0]).toContain('gwdg');
+    expect(PLANET_MIRRORS.some((u) => u.includes('planet.openstreetmap.org/pbf'))).toBe(true);
+  });
+});
+
+describe('publish', () => {
+  const t0 = Date.parse('2026-12-02T03:00:00Z');
+  const write = (dir: string, name: string, part: object) => writeFileSync(join(dir, name), JSON.stringify(part));
+  const parts = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-parts-'));
+    write(dir, 'nodes.json', { groups: ['points', 'trees'], dataAt: t0 - 3600e3, files: { cctv: 'cctv-2026-12-02.pmtiles', trees: 'trees-2026-12-02.pmtiles' }, sets: { cctv: { bytes: 5, features: 2 }, trees: { bytes: 7, features: 3 } }, heatCells: { cctv: 4 } });
+    write(dir, 'roofs.json', { groups: ['roofs'], dataAt: t0 - 7200e3, files: { roofs: 'roofs-2026-12-02.pmtiles' }, sets: { roofs: { bytes: 9, features: 1 } } });
+    return dir;
+  };
+
+  it('joins the parts of both jobs to one meta.json', () => {
+    const out = mkdtempSync(join(tmpdir(), 'osm-dist-'));
+    const meta = publish(parts(), out, { date: '2026-12-02', now: t0 });
+    expect(Object.keys(meta.files).sort()).toEqual(['cctv', 'roofs', 'trees']);
+    expect(meta.sets.roofs.bytes).toBe(9);
+    expect(meta.heatCells).toBe(4);
+    expect(meta.oldest).toBe(t0 - 7200e3);
+    expect(meta.newest).toBe(t0 - 3600e3);
+    expect(JSON.parse(readFileSync(join(out, 'meta.json'), 'utf8')).version).toBe('2026-12-02');
+    expect(existsSync(join(out, 'LICENSE.txt'))).toBe(true);
+  });
+
+  it('refuses to publish when a job delivered nothing (its files would vanish from meta.json)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-parts-'));
+    write(dir, 'roofs.json', { groups: ['roofs'], files: { roofs: 'roofs-2026-12-02.pmtiles' }, sets: {} });
+    expect(() => publish(dir, mkdtempSync(join(tmpdir(), 'osm-dist-')), { now: t0 })).toThrow(/points/);
+  });
+
+  it('the superseded versions are retired, deleted after the cache time', () => {
+    const prev = join(mkdtempSync(join(tmpdir(), 'osm-prev-')), 'meta.json');
+    writeFileSync(prev, JSON.stringify({ files: { cctv: 'cctv-2026-11-02.pmtiles' }, retired: [{ file: 'old.pmtiles', at: t0 - 48 * 3600e3 }] }));
+    const out = mkdtempSync(join(tmpdir(), 'osm-dist-'));
+    const list = join(out, 'delete.txt');
+    const meta = publish(parts(), out, { prev, deleteList: list, now: t0 });
+    expect(meta.retired.map((r: { file: string }) => r.file)).toEqual(['cctv-2026-11-02.pmtiles']);
+    expect(readFileSync(list, 'utf8')).toBe('old.pmtiles\n');
+  });
+
+  it('updates the bucket manifest: new files in (with source and licence), deleted ones out, the rest stays', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-man-'));
+    const manifest = join(dir, 'manifest.json');
+    writeFileSync(manifest, JSON.stringify({ 'other.json': { updated: 'x', bytes: 1, source: 's', license: 'l' }, 'old.pmtiles': { updated: 'x', bytes: 2, source: '', license: '' } }));
+    const prev = join(dir, 'prev.json');
+    writeFileSync(prev, JSON.stringify({ files: {}, retired: [{ file: 'old.pmtiles', at: t0 - 48 * 3600e3 }] }));
+    publish(parts(), join(dir, 'dist'), { prev, manifest, now: t0 });
+    const m = JSON.parse(readFileSync(manifest, 'utf8'));
+    expect(Object.keys(m)).toEqual(expect.arrayContaining(['cctv-2026-12-02.pmtiles', 'roofs-2026-12-02.pmtiles', 'meta.json', 'LICENSE.txt', 'other.json']));
+    expect(m['roofs-2026-12-02.pmtiles']).toMatchObject({ bytes: 9, license: expect.stringContaining('ODbL') });
+    expect(m['old.pmtiles']).toBeUndefined();
   });
 });
