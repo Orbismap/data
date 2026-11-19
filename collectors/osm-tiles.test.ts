@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, retryAfterSeconds, backoffMs, probeSizes, download, GeofabrikUnreachable, UNREACHABLE_EXIT } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, missingUnits, retryAfterSeconds, backoffMs, probeSizes, download, GeofabrikUnreachable, UNREACHABLE_EXIT } from './osm-tiles.mjs';
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -150,6 +150,13 @@ describe('plan', () => {
   it('a daily run stays small: about every 30 days each unit', () => {
     expect(dailyCount(90)).toBe(3);
     expect(dailyCount(91)).toBe(4);
+  });
+
+  it('missingUnits: only pieces of the current format count', () => {
+    const names = [`a.f${FORMAT}.points.tar`, `b.f${FORMAT - 1}.points.tar`, `c.f${FORMAT}.roofs.pmtiles`, `d.f${FORMAT}.points.tar`];
+    expect(missingUnits(['a', 'b', 'c', 'd'], names)).toEqual(['b', 'c']);
+    expect(missingUnits(['a'], [])).toEqual(['a']);
+    expect(missingUnits([], names)).toEqual([]);
     expect(dailyCount(1)).toBe(1);
   });
 });

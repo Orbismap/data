@@ -395,6 +395,11 @@ export const stateAsset = (key) => `${key}.f${FORMAT}.points.tar`;
 export const assetName = (key, group) => `${key}.f${FORMAT}.${group}.${GROUPS[group].length > 1 ? 'tar' : 'pmtiles'}`;
 
 /** how many units a daily run refreshes: a 30th of all (rounded up), so every unit is due about every 30 days */
+// units without a piece of the current format (names = asset names of the release osm-src-points)
+export const missingUnits = (units, names, format = FORMAT) => {
+  const have = new Set(names.filter((n) => n.endsWith(`.f${format}.points.tar`)).map((n) => n.slice(0, -`.f${format}.points.tar`.length)));
+  return units.filter((u) => !have.has(u));
+};
 export const dailyCount = (n) => Math.ceil(n / MAX_AGE_DAYS);
 
 /** which units to refresh: `all` (the oldest MAX_ALL), the given one, or the oldest ones that are due (a 30th of all per run: rolling) */
@@ -632,6 +637,12 @@ async function main() {
     const [indexFile] = args;
     if (!indexFile) throw new Error('usage: osm-tiles units <index.json>');
     console.log(JSON.stringify(unitRegions(readJson(indexFile), loadSizes()).map((r) => r.key)));
+  } else if (cmd === 'coverage') {
+    const [unitsFile, namesFile] = args;
+    if (!unitsFile || !namesFile) throw new Error('usage: osm-tiles coverage <units.json> <asset-names.txt>   (prints {format,total,missing})');
+    const units = readJson(unitsFile);
+    const names = readFileSync(namesFile, 'utf8').split('\n').filter(Boolean);
+    console.log(JSON.stringify({ format: FORMAT, total: units.length, missing: missingUnits(units, names) }));
   } else if (cmd === 'sizes') {
     const [indexFile] = args;
     if (!indexFile) throw new Error('usage: osm-tiles sizes <index.json> [--max bytes]   (updates collectors/osm-sizes.json)');

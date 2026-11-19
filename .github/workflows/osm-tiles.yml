@@ -102,6 +102,7 @@ jobs:
           REGIONS=$(node collectors/osm-tiles.mjs plan index.json assets.json $ARG)
           echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
           echo "units to refresh: $REGIONS"
+          echo "### plan: $(echo "$REGIONS" | jq length) of $(echo "$(node collectors/osm-tiles.mjs units index.json)" | jq length) units to build" >> "$GITHUB_STEP_SUMMARY"
       # the extract jobs take the index from here instead of all asking Geofabrik for it
       - uses: actions/upload-artifact@v4
         with:
@@ -190,8 +191,8 @@ jobs:
 
   merge:
     needs: [plan, extract, retry-plan, extract-retry]
-    # also when single regions failed: the others are in the releases and the world files are built from what exists
-    if: ${{ !cancelled() && (needs.plan.outputs.regions != '[]' || github.event.inputs.merge_only == 'true') }}
+    # also when single regions failed (the others are in the releases), but never without a plan (no unit list = nothing to check against)
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.regions != '[]' || github.event.inputs.merge_only == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -213,28 +214,28 @@ jobs:
             echo '::error::R2 credentials missing - the world files go to the bucket orbis-osm'
             exit 1
           fi
-          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
           mkdir -p work
           echo "$UNITS" > work/units.json
           id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-points" --jq .id 2>/dev/null) || id=""
           if [ -n "$id" ]; then gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[].name' > work/names.txt; else : > work/names.txt; fi
-          missing=$(jq -nr --arg f "$FORMAT" --argjson u "$UNITS" --rawfile n work/names.txt \
-            '$u - ($n | split("\n") | map(select(endswith(".f" + $f + ".points.tar")) | sub("\\.f" + $f + "\\.points\\.tar$"; ""))) | .[]')
-          total=$(echo "$UNITS" | jq length)
-          if [ -z "$missing" ]; then
-            echo "all $total units have a piece of format $FORMAT"
-            echo 'skip=false' >> "$GITHUB_OUTPUT"
-            echo 'complete=true' >> "$GITHUB_OUTPUT"
+          node collectors/osm-tiles.mjs coverage work/units.json work/names.txt > work/coverage.json
+          format=$(jq -r .format work/coverage.json); total=$(jq -r .total work/coverage.json); n=$(jq '.missing | length' work/coverage.json)
+          echo "format=$format" >> "$GITHUB_OUTPUT"
+          if [ "$n" = 0 ]; then
+            echo "all $total units have a piece of format $format"
+            echo 'skip=false' >> "$GITHUB_OUTPUT"; echo 'complete=true' >> "$GITHUB_OUTPUT"
+            echo "### merge: all $total units covered, world files published" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::$(echo "$missing" | wc -l | tr -d ' ') of $total units have no piece of format $FORMAT yet (first: $(echo "$missing" | head -5 | tr '\n' ' '))"
-            echo 'complete=false' >> "$GITHUB_OUTPUT"
-            echo '::notice::merge skipped - the world files in the bucket stay as they are until all units are built (all_regions, repeat)'
-            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            first=$(jq -r '.missing[:5] | join(" ")' work/coverage.json)
+            echo "::warning::$n of $total units have no piece of format $format yet (first: $first)"
+            echo "::notice::merge skipped - the world files in the bucket stay as they are until all units are built (all_regions, repeat)"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"; echo 'complete=false' >> "$GITHUB_OUTPUT"
+            echo "### merge skipped: $n of $total units still missing (format $format)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Regional pieces of all units (releases osm-src-*)
         if: steps.cov.outputs.skip != 'true'
         run: |
-          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          FORMAT=${{ steps.cov.outputs.format }}
           mkdir -p work/assets
           for g in points trees roofs; do
             id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
@@ -280,7 +281,7 @@ jobs:
       - name: Remove regional pieces of older formats (only when every unit has a current piece)
         if: steps.cov.outputs.complete == 'true' && steps.cov.outputs.skip != 'true'
         run: |
-          FORMAT=$(node -e "import('./collectors/osm-tiles.mjs').then(m => console.log(m.FORMAT))")
+          FORMAT=${{ steps.cov.outputs.format }}
           for g in points trees roofs; do
             id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/osm-src-$g" --jq .id 2>/dev/null) || continue
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/$id/assets" --jq '.[] | "\(.id) \(.name)"' \
