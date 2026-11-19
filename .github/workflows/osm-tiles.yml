@@ -10,6 +10,9 @@ name: OSM tiles
 #            beachtet), schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und lädt sie nacheinander als Assets
 #            in die GitHub-Releases osm-src-points (ein tar je Einheit mit den sechs Punktsätzen, zuletzt: das ist der Zustand),
 #            osm-src-trees und osm-src-roofs (je Release höchstens 1000 Assets, je Asset höchstens 2 GB)
+#            Gelingt kein Verbindungsaufbau zu Geofabrik (curl Exit 6/7: die Adresse des Runners ist gesperrt, Warten hilft nicht), gibt der
+#            Job nach 3 Versuchen auf (Exit 75 `geofabrik-unreachable`); `retry-plan` sammelt diese Einheiten, `extract-retry` baut sie auf
+#            frischen Runnern ein zweites Mal (dort ist ein Fehler endgültig)
 #   merge    prüft, dass für ALLE Einheiten ein Stück des aktuellen FORMAT vorliegt (sonst wird nichts veröffentlicht: nach einer FORMAT-Änderung
 #            bleiben die Welt-Dateien im Bucket, bis alle Einheiten neu gebaut sind), lädt die Stücke, führt sie je Thema mit tile-join zur
 #            Welt-Datei zusammen (<thema>-<datum>.pmtiles, Verweis in meta.json), lädt sie nach orbis-osm und löscht abgelöste Versionen,
@@ -125,35 +128,68 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: sudo apt-get install -y --no-install-recommends osmium-tool
-      - uses: ./.github/actions/tippecanoe
-      - uses: actions/download-artifact@v4
+      - id: ex
+        uses: ./.github/actions/osm-extract
         with:
-          name: geofabrik-index
-      - name: Disk
-        run: df -h / | tail -1
-      - name: Extract ${{ matrix.region }}
+          region: ${{ matrix.region }}
+          releases: ${{ needs.plan.outputs.releases }}
+      # Geofabrik cannot be reached from this runner: remember the unit, retry-plan collects them for a second round on other runners
+      - if: steps.ex.outputs.unreachable == 'true'
+        run: mkdir retry && echo "${{ matrix.region }}" > "retry/${{ matrix.region }}.txt"
+      - if: steps.ex.outputs.unreachable == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: retry-${{ matrix.region }}
+          path: retry/
+          retention-days: 1
+
+  # Second round for the units whose extract found no connection to Geofabrik (a blocked address of a runner stays blocked, so waiting in the
+  # same job is useless; a new job gets a new runner). One round only: what fails here fails the run, a new start with `region` repeats it.
+  retry-plan:
+    needs: [plan, extract]
+    if: ${{ !cancelled() && needs.plan.outputs.regions != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      regions: ${{ steps.list.outputs.regions }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # no artifact = nothing to repeat
+        with:
+          pattern: retry-*
+          path: retry
+          merge-multiple: true
+      - id: list
         run: |
-          node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
-      - name: Regional PMTiles
-        run: |
-          node collectors/osm-tiles.mjs regional out "${{ matrix.region }}"
-          ls -la out/upload
-      - name: Upload to the GitHub releases osm-src-<group>
-        env:
-          RELEASES: ${{ needs.plan.outputs.releases }}
-        run: |
-          # one after the other (osm-release-upload.sh waits on rate limits): roofs and trees first, the points tar last (it is the state
-          # `plan` looks at, so a failed upload does not count as refreshed)
-          for g in roofs trees points; do
-            for f in out/upload/*."$g".*; do
-              [ -e "$f" ] || continue
-              collectors/osm-release-upload.sh "$GITHUB_REPOSITORY" "$(echo "$RELEASES" | jq -r ".$g")" "$f"
-            done
-          done
+          regions=$(cat retry/*.txt 2>/dev/null | jq -R . | jq -sc . || true)
+          echo "regions=${regions:-[]}" >> "$GITHUB_OUTPUT"
+          echo "second round: ${regions:-[]}"
+
+  extract-retry:
+    needs: [plan, retry-plan]
+    if: ${{ !cancelled() && needs.retry-plan.outputs.regions != '' && needs.retry-plan.outputs.regions != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write # releases osm-src-*
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        region: ${{ fromJSON(needs.retry-plan.outputs.regions) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ./.github/actions/osm-extract
+        with:
+          region: ${{ matrix.region }}
+          releases: ${{ needs.plan.outputs.releases }}
+          final: 'true'
 
   merge:
-    needs: [plan, extract]
+    needs: [plan, extract, retry-plan, extract-retry]
     # also when single regions failed: the others are in the releases and the world files are built from what exists
     if: ${{ !cancelled() && (needs.plan.outputs.regions != '[]' || github.event.inputs.merge_only == 'true') }}
     runs-on: ubuntu-latest

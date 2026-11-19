@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, retryAfterSeconds, backoffMs, probeSizes } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, assetName, stateAsset, planRegions, retireVersions, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, makeOwner, dailyCount, retryAfterSeconds, backoffMs, probeSizes, download, GeofabrikUnreachable, UNREACHABLE_EXIT } from './osm-tiles.mjs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import sizesTable from './osm-sizes.json';
 
 describe('trees set', () => {
@@ -319,5 +322,43 @@ describe('download pauses', () => {
     const sizes = await probeSizes(idx, { a: 9e9 }, 3e9, async (url: string) => { asked.push(url); return url.includes('/c-') ? 1e9 : 2e9; }, 0);
     expect(sizes).toEqual({ a: 9e9, a_b: 2e9, c: 1e9 });
     expect(asked).toHaveLength(2);
+  });
+});
+
+describe('download without a connection', () => {
+  // a fake curl first on the PATH: counts its calls and fails like curl does when the TCP connection is refused (exit 7)
+  const withFakeCurl = async (script: string, fn: (dir: string) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-curl-'));
+    writeFileSync(join(dir, 'curl'), `#!/bin/bash\necho x >> "${dir}/calls"\n${script}\n`);
+    chmodSync(join(dir, 'curl'), 0o755);
+    const path = process.env.PATH;
+    process.env.PATH = `${dir}:${path}`;
+    try {
+      await fn(dir);
+    } finally {
+      process.env.PATH = path;
+    }
+  };
+  const calls = (dir: string) => readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n').length;
+
+  it('curl exit 7: gives up after 3 tries with GeofabrikUnreachable (exit code 75 in main)', async () => {
+    await withFakeCurl('exit 7', async (dir) => {
+      await expect(download('https://download.geofabrik.de/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] })).rejects.toBeInstanceOf(GeofabrikUnreachable);
+      expect(calls(dir)).toBe(3);
+    });
+    expect(UNREACHABLE_EXIT).toBe(75);
+  });
+
+  it('an HTTP answer (429 with Retry-After) is not "unreachable": it retries with the pause and then succeeds', async () => {
+    // 1st call: 429 + exit 22 (--fail); 2nd call: 200 and a file
+    const script = `n=$(wc -l < "$(dirname "$0")/calls")
+hdr=""; out=""; while [ $# -gt 0 ]; do case "$1" in -D) hdr=$2; shift;; -o) out=$2; shift;; esac; shift; done
+if [ "$n" -lt 2 ]; then printf 'HTTP/2 429\r\nretry-after: 0\r\n\r\n' > "$hdr"; exit 22; fi
+printf 'HTTP/2 200\r\n\r\n' > "$hdr"; echo data > "$out"`;
+    await withFakeCurl(script, async (dir) => {
+      await download('https://download.geofabrik.de/x.osm.pbf', join(dir, 'x.pbf'), 8, { connectPauseMs: [0] });
+      expect(calls(dir)).toBe(2);
+      expect(readFileSync(join(dir, 'x.pbf'), 'utf8')).toBe('data\n');
+    });
   });
 });

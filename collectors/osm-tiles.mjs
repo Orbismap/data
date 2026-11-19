@@ -129,23 +129,47 @@ export function backoffMs(attempt, retryAfter = null) {
   return Math.round(base * (1 + Math.random() * 0.25));
 }
 
+/** exit code of `extract` when Geofabrik cannot be reached at all from this runner (TCP connect fails): the workflow builds the unit again on another runner */
+export const UNREACHABLE_EXIT = 75;
+export class GeofabrikUnreachable extends Error {
+  constructor(url, attempts) {
+    super(`geofabrik-unreachable: no connection to ${url} (${attempts} attempts)`);
+    this.name = 'GeofabrikUnreachable';
+  }
+}
+/** curl exit codes for "no connection": 6 (cannot resolve host), 7 (cannot connect) */
+const NO_CONNECTION = [6, 7];
+
 /**
  * Downloads `url` to `file`, one request at a time, resuming a partial file (-C -). On a failure (429/503/5xx, connect error, stall) it waits
  * (Retry-After if the server sent one, else growing pauses) and continues, up to `attempts` times. A refusal that is no overload (404 …) fails at once.
+ * No connection at all (no HTTP answer, curl exit 6/7) will not get better on this runner (an address that is blocked stays blocked): after
+ * `connectAttempts` tries with short pauses it throws GeofabrikUnreachable.
  */
-export async function download(url, file, attempts = 8) {
+export async function download(url, file, attempts = 8, { connectAttempts = 3, connectPauseMs = [5000, 30_000] } = {}) {
   const hdr = `${file}.headers`;
+  let noConnection = 0;
   for (let i = 1; ; i++) {
     let failed = false;
+    let exitCode = 0;
     try {
       await sh(`curl -sSL --fail --connect-timeout 30 --speed-limit 200000 --speed-time 180 -A "${USER_AGENT}" -C - -D "${hdr}" -o "${file}" "${url}"`);
-    } catch {
+    } catch (e) {
       failed = true; // connect error, stall, HTTP error (--fail): the headers tell which
+      exitCode = e.exitCode ?? 0;
     }
     const code = Number((existsSync(hdr) ? [...readFileSync(hdr, 'utf8').matchAll(/^HTTP\/\S+ (\d+)/gm)].pop()?.[1] : null) ?? 0);
     if (code === 416 || (!failed && (code === 0 || (code >= 200 && code < 300)))) {
       rmSync(hdr, { force: true }); // 416: the file was complete already
       return;
+    }
+    if (failed && code === 0 && NO_CONNECTION.includes(exitCode)) {
+      rmSync(hdr, { force: true });
+      if (++noConnection >= connectAttempts) throw new GeofabrikUnreachable(url, noConnection);
+      const ms = connectPauseMs[noConnection - 1] ?? connectPauseMs.at(-1) ?? 0;
+      console.error(`download ${url}: no connection (curl ${exitCode}, ${noConnection}/${connectAttempts}) – retrying in ${Math.round(ms / 1000)} s`);
+      await sleep(ms);
+      continue;
     }
     const retryAfter = existsSync(hdr) ? retryAfterSeconds(readFileSync(hdr, 'utf8').match(/^retry-after:\s*(.+?)\s*$/im)?.[1]) : null;
     rmSync(hdr, { force: true });
@@ -161,7 +185,7 @@ function sh(cmd) {
   return new Promise((res, rej) => {
     const p = spawn('bash', ['-c', `set -o pipefail; ${cmd}`], { stdio: ['ignore', 'inherit', 'inherit'] });
     p.on('error', rej);
-    p.on('close', (c) => (c === 0 ? res() : rej(new Error(`pipeline failed (exit ${c}): ${cmd.slice(0, 120)}`))));
+    p.on('close', (c) => (c === 0 ? res() : rej(Object.assign(new Error(`pipeline failed (exit ${c}): ${cmd.slice(0, 120)}`), { exitCode: c }))));
   });
 }
 
@@ -330,7 +354,7 @@ async function extractWithRetry(key, outDir, opts, attempts = 2) {
     try {
       return await extract(key, outDir, opts);
     } catch (e) {
-      if (i >= attempts) throw e;
+      if (e instanceof GeofabrikUnreachable || i >= attempts) throw e; // unreachable: another runner has to try, not this one again
       console.error(`${key}: attempt ${i}/${attempts} failed (${e.message}) – starting over in ${i * 60} s`);
       await sleep(i * 60_000);
     }
@@ -652,5 +676,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.exitCode = 1;
     }
   });
-  main().then(() => { finished = true; }, (e) => { finished = true; console.error(e.message); process.exit(1); });
+  main().then(
+    () => { finished = true; },
+    (e) => {
+      finished = true;
+      console.error(e.message);
+      process.exit(e instanceof GeofabrikUnreachable ? UNREACHABLE_EXIT : 1);
+    },
+  );
 }

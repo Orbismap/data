@@ -1,0 +1,68 @@
+name: osm-extract
+description: one unit of the osm-tiles build - download and extract, regional PMTiles, upload to the releases osm-src-* (the job has checked out the repo and set up node)
+inputs:
+  region:
+    description: unit key (europe_germany)
+    required: true
+  releases:
+    description: JSON {points, trees, roofs} with the release ids (output of the plan job)
+    required: true
+  final:
+    description: 'true: a Geofabrik that cannot be reached fails the job; false: the job ends green with output unreachable=true (a later job tries again on another runner)'
+    default: 'false'
+outputs:
+  unreachable:
+    description: 'true when Geofabrik could not be reached from this runner (nothing was built)'
+    value: ${{ steps.extract.outputs.unreachable }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: sudo apt-get install -y --no-install-recommends osmium-tool
+    - uses: ./.github/actions/tippecanoe
+    - uses: actions/download-artifact@v4
+      with:
+        name: geofabrik-index
+    - name: Disk
+      shell: bash
+      run: df -h / | tail -1
+    - name: Extract
+      id: extract
+      shell: bash
+      env:
+        REGION: ${{ inputs.region }}
+        FINAL: ${{ inputs.final }}
+      run: |
+        set +e
+        node collectors/osm-tiles.mjs extract out "$REGION" --index index.json
+        rc=$?
+        # 75 = geofabrik-unreachable: no TCP connection from this runner (an address that is blocked stays blocked). Not worth waiting here:
+        # another job (= another runner) builds the unit again, see the workflow
+        if [ "$rc" -eq 75 ] && [ "$FINAL" != "true" ]; then
+          echo "::warning::$REGION: Geofabrik not reachable from this runner - the unit is built again in a later job"
+          echo 'unreachable=true' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exit "$rc"
+    - name: Regional PMTiles
+      if: steps.extract.outputs.unreachable != 'true'
+      shell: bash
+      env:
+        REGION: ${{ inputs.region }}
+      run: |
+        node collectors/osm-tiles.mjs regional out "$REGION"
+        ls -la out/upload
+    - name: Upload to the GitHub releases osm-src-<group>
+      if: steps.extract.outputs.unreachable != 'true'
+      shell: bash
+      env:
+        RELEASES: ${{ inputs.releases }}
+      run: |
+        # one after the other (osm-release-upload.sh waits on rate limits): roofs and trees first, the points tar last (it is the state
+        # `plan` looks at, so a failed upload does not count as refreshed)
+        for g in roofs trees points; do
+          for f in out/upload/*."$g".*; do
+            [ -e "$f" ] || continue
+            collectors/osm-release-upload.sh "$GITHUB_REPOSITORY" "$(echo "$RELEASES" | jq -r ".$g")" "$f"
+          done
+        done
