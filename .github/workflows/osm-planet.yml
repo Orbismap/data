@@ -14,10 +14,6 @@ name: OSM planet
 # In R2 liegen nur die fertigen Welt-Dateien (+ heat/cctv.json, meta.json, LICENSE.txt). R2-Zugangsdaten sind Pflicht.
 
 on:
-  # TEMPORARY (remove before the merge): every push to this branch is a DRY RUN - build and measure, but no R2 access at all
-  # (no credentials needed, no upload, no publish), so the world files in orbis-osm and the app stay untouched
-  push:
-    branches: [claude/osm-planet]
   schedule:
     - cron: '17 3 1 * *'
   repository_dispatch:
@@ -56,7 +52,6 @@ jobs:
     steps:
       # fail before the hours of work, not after
       - name: R2 credentials
-        if: github.event_name != 'push'
         run: |
           if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
             echo '::error::R2 credentials missing - the world files go to the bucket orbis-osm'
@@ -84,13 +79,12 @@ jobs:
         run: |
           [ -f "parts/${{ matrix.name }}.json" ] || exit 0
           {
-            echo "### ${{ matrix.name }}${{ github.event_name == 'push' && ' (dry run: nothing uploaded)' || '' }}"
+            echo "### ${{ matrix.name }}"
             echo '| file | bytes | features |'
             echo '|---|---|---|'
             jq -r '.sets | to_entries[] | "| \(.key) | \(.value.bytes) | \(.value.features) |"' "parts/${{ matrix.name }}.json"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload to R2 (orbis-osm), without meta.json
-        if: github.event_name != 'push'
         run: |
           aws s3 sync work/dist s3://orbis-osm/ --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
             --cache-control "public, max-age=86400" --only-show-errors
@@ -102,7 +96,6 @@ jobs:
 
   publish:
     needs: build
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
