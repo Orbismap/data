@@ -37,21 +37,22 @@ export function leafRegions(index) {
 }
 
 /**
- * An extract is built as ONE unit while its pbf is at most this big. What limits it is the runner disk: the pbf, the intermediates (GeoJSON
- * lines: ~130 B per tree, ~410 B per roof building; Berlin, the densest case, 100 MB pbf -> 95 MB, a sparse continent far less), tippecanoe's
- * temporary files for the biggest one (about 1 x) and the polygon filter files (about 0.5 x) coexist: at most ~3.5 x the pbf in dense regions
- * (France, Germany: ~5 GB -> ~17 GB), ~1.5 x in sparse ones (Africa, Canada, Russia, South America). The runner has ~14 GB free, ~40 GB after the
- * workflow removed the preinstalled toolchains. Release assets (2 GB each) are far smaller: trees ~6 B and roofs ~26 B per feature (Berlin),
- * i.e. ~150 MB and ~80 MB for Germany.
+ * An extract is built as ONE unit while its pbf is at most this big. Limits: the 2 GB of a release asset, the 6 h of a job and the RAM (16 GB)
+ * of osmium and tippecanoe; NOT the disk (~100 GB free) and not the run time otherwise. Measured on Berlin (the densest case: 100 MB pbf, 15 s
+ * for everything): the assets are 0.059 x the pbf in all (roofs 0.036, trees 0.016, points 0.006), the run time 0.15 s per MB; Hessen's roofs
+ * are 0.014 x. So even Europe (35.5 GB) would be at worst ~1.3 GB roofs (Berlin ratio, likely 0.5 GB), ~0.6 GB trees, ~90 min: the 2 GB and the 6 h
+ * would allow one unit of up to ~40 GB (9 units in all). 20 GB (57 units: North America 19.6, Asia 16.5, Africa 8.0 as one, Europe in countries,
+ * the biggest France 5.1 and Germany 4.9) keeps a margin for what is not measured: the RAM of osmium/tippecanoe above Germany (16 GB runner).
+ * If a unit runs out of RAM or time, lower this constant (merge ignores pieces of units that no longer exist).
  */
-export const UNIT_MAX_BYTES = 8e9;
+export const UNIT_MAX_BYTES = 20e9;
 
 /** path of a region on Geofabrik without `-latest.osm.pbf` (europe/germany/hessen) */
 const pathOf = (pbfUrl) => pbfUrl.replace(/^https?:\/\/download\.geofabrik\.de\//, '').replace(/-latest\.osm\.pbf$/, '');
 
 /**
  * The tree of the index by path (europe/germany/hessen is below europe/germany; the `parent` field of the index is not used: it
- * puts the US states below north-america). Collective extracts are no nodes, what lies below one becomes a root.
+ * puts the US states below north-america). Collective extracts are no nodes, what lies below one hangs on the next ancestor (or is a root).
  * → { roots, nodes: Map<key, node> }, node = { key, id, url, geometry, bbox, children }, everything sorted by key
  */
 export function regionTree(index) {
@@ -60,8 +61,10 @@ export function regionTree(index) {
   const byPath = new Map([...nodes.values()].map((n) => [pathOf(n.url), n]));
   const roots = [];
   for (const n of nodes.values()) {
-    const p = pathOf(n.url);
-    const parent = p.includes('/') ? byPath.get(p.slice(0, p.lastIndexOf('/'))) : null;
+    // the nearest ancestor by path that is a node: below a collective extract (north-america/us/ohio, us is none) that is the one above it,
+    // so a unit north-america also covers the states
+    let p = pathOf(n.url), parent = null;
+    while (!parent && p.includes('/')) parent = byPath.get((p = p.slice(0, p.lastIndexOf('/'))));
     (parent ?? { children: roots }).children.push(n);
   }
   const sort = (list) => list.sort((a, b) => (a.key < b.key ? -1 : 1)).forEach((n) => sort(n.children));

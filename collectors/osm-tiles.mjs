@@ -37,6 +37,8 @@ import { boxOwner, leafRegions, makeOwner, regionKey, regionTree, unitRegions, U
 export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, leafRegions, unitRegions, regionTree, UNIT_MAX_BYTES, regionKey, AGGREGATES, makeOwner };
 
 const MAX_AGE_DAYS = 30;
+/** GitHub release assets are limited to 2 GiB; stay below it so that the failure comes before the upload */
+const ASSET_MAX_BYTES = 1.9e9;
 /** units per run with `all` (first run / migration: in batches, the oldest first; every run ends with a merge) */
 const MAX_ALL = 40;
 /** committed table { key: pbf bytes } of the Geofabrik extracts (written by `sizes`, the index has no sizes); decides which regions are units */
@@ -322,8 +324,8 @@ async function extract(key, outDir, { url, owner }) {
   return counts;
 }
 
-/** the download retries itself (download()); on any other failure (osmium, a broken file) start the region over, up to 3 times */
-async function extractWithRetry(key, outDir, opts, attempts = 3) {
+/** the download retries itself (download()); on any other failure (osmium, a broken file) start the region over once (a job has 6 h) */
+async function extractWithRetry(key, outDir, opts, attempts = 2) {
   for (let i = 1; ; i++) {
     try {
       return await extract(key, outDir, opts);
@@ -485,7 +487,9 @@ async function packageRegional(key, regionalDir, uploadDir) {
       const members = [...present.map((f) => `${f}.pmtiles`), ...readdirSync(regionalDir).filter((f) => /^heat-.*\.json$/.test(f)), 'info.json'];
       await run('tar', ['-cf', target, '-C', regionalDir, ...members]);
     }
-    made.push({ group, asset: assetName(key, group), bytes: statSync(target).size });
+    const bytes = statSync(target).size;
+    if (bytes > ASSET_MAX_BYTES) throw new Error(`${assetName(key, group)} is ${bytes} bytes: a release asset holds at most 2 GB, lower UNIT_MAX_BYTES`);
+    made.push({ group, asset: assetName(key, group), bytes });
   }
   return made;
 }

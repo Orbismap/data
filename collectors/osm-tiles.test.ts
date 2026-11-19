@@ -226,13 +226,26 @@ describe('units', () => {
     expect(t.nodes.has('europe_dach')).toBe(false);
   });
 
+  it('below a collective extract the nearest ancestor is the parent: a unit north-america covers the states', () => {
+    const idx2 = { features: [
+      feat('north-america', 'north-america', sq(100, 0, 40, 10)),
+      feat('us', 'north-america/us', sq(100, 0, 30, 10)),
+      feat('us/ohio', 'north-america/us/ohio', sq(100, 0, 10)),
+      feat('canada', 'north-america/canada', sq(130, 0, 10)),
+    ] };
+    expect(regionTree(idx2).roots.map((n: { key: string }) => n.key)).toEqual(['north-america']);
+    const keys = (sizes: Record<string, number>) => unitRegions(idx2, sizes, 20 * GB).map((r: { key: string }) => r.key);
+    expect(keys({ 'north-america': 19 * GB })).toEqual(['north-america']);
+    expect(keys({ 'north-america': 21 * GB })).toEqual(['north-america_canada', 'north-america_us_ohio']);
+  });
+
   it('threshold: the biggest region that fits is one unit, bigger ones are split', () => {
     const sizes = { europe: 30 * GB, europe_germany: 4 * GB, europe_germany_berlin: 0.1 * GB, europe_germany_brandenburg: 0.3 * GB, europe_germany_hessen: 0.4 * GB, europe_poland: 1.5 * GB };
     expect(keysOf(sizes)).toEqual(['europe_germany_berlin', 'europe_germany_brandenburg', 'europe_germany_hessen', 'europe_poland', 'north-america_us_ohio']);
     expect(keysOf({ ...sizes, europe_germany: 2.9 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // fits: its children are not units
     expect(keysOf({ ...sizes, europe_germany: 3 * GB })).toEqual(['europe_germany', 'europe_poland', 'north-america_us_ohio']); // exactly the limit still fits
     expect(keysOf({ ...sizes, europe: 3 * GB })).toEqual(['europe', 'north-america_us_ohio']);
-    expect(UNIT_MAX_BYTES).toBe(8 * GB);
+    expect(UNIT_MAX_BYTES).toBe(20 * GB);
   });
 
   it('unknown sizes: a region with children is split (safe), a leaf is a unit', () => {

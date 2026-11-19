@@ -2,9 +2,9 @@ name: OSM tiles
 
 # OSM-Daten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume, Dächer) als PMTiles, eine Datei je Thema weltweit
 # (collectors/osm-tiles.mjs, Themen-Registry collectors/osm-themes.mjs). Läuft täglich (Dispatch der Uhr, type `osm-tiles`):
-#   plan     Geofabrik-Index (index-v1.json) -> ca. 150 EINHEITEN: von oben nach unten die jeweils größte Region, deren PBF höchstens 8 GB hat
+#   plan     Geofabrik-Index (index-v1.json) -> 57 EINHEITEN: von oben nach unten die jeweils größte Region, deren PBF höchstens 20 GB hat
 #            (Größentabelle collectors/osm-sizes.json), größere werden in ihre Unterregionen zerlegt. Wählt die ältesten Einheiten, die älter
-#            als 30 Tage sind (ein Dreißigstel aller Einheiten je Lauf = rollierend, ca. 5 am Tag), oder bei `all_regions` die 40 ältesten.
+#            als 30 Tage sind (ein Dreißigstel aller Einheiten je Lauf = rollierend, 2 am Tag), oder bei `all_regions` die 40 ältesten (Erstlauf: 2 Läufe).
 #            Alter einer Einheit = Upload-Zeit ihres Assets `<einheit>.f<FORMAT>.points.tar` im Release osm-src-points
 #   extract  Matrix-Job je Einheit (höchstens 5 parallel): lädt den Auszug (ein Download, mit Wiederholung und Wartezeit, Retry-After wird
 #            beachtet), schreibt die Zwischendateien, baut daraus mit tippecanoe die REGIONAL-PMTiles und lädt sie nacheinander als Assets
@@ -34,10 +34,6 @@ on:
         default: false
       merge_only:
         description: 'Nur zusammenführen (aus den vorhandenen Regional-Stücken), keine Region bauen'
-        type: boolean
-        default: false
-      partial_merge:
-        description: 'Auch zusammenführen, wenn für manche Einheiten noch kein Stück des aktuellen FORMAT vorliegt (die Welt-Dateien haben dann Lücken)'
         type: boolean
         default: false
 
@@ -115,7 +111,7 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.regions != '[]' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
     permissions:
       contents: write # releases osm-src-*
     strategy:
@@ -134,10 +130,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: geofabrik-index
-      - name: Free disk space (units of up to 8 GB need the room)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
-          df -h / | tail -1
+      - name: Disk
+        run: df -h / | tail -1
       - name: Extract ${{ matrix.region }}
         run: |
           node collectors/osm-tiles.mjs extract out "${{ matrix.region }}" --index index.json
@@ -163,7 +157,7 @@ jobs:
     # also when single regions failed: the others are in the releases and the world files are built from what exists
     if: ${{ !cancelled() && (needs.plan.outputs.regions != '[]' || github.event.inputs.merge_only == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -178,7 +172,6 @@ jobs:
         id: cov
         env:
           UNITS: ${{ needs.plan.outputs.units }}
-          PARTIAL: ${{ github.event.inputs.partial_merge || 'false' }}
         run: |
           if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo '::error::R2 credentials missing - the world files go to the bucket orbis-osm'
@@ -199,11 +192,8 @@ jobs:
           else
             echo "::warning::$(echo "$missing" | wc -l | tr -d ' ') of $total units have no piece of format $FORMAT yet (first: $(echo "$missing" | head -5 | tr '\n' ' '))"
             echo 'complete=false' >> "$GITHUB_OUTPUT"
-            if [ "$PARTIAL" = "true" ]; then echo 'skip=false' >> "$GITHUB_OUTPUT"
-            else
-              echo '::notice::merge skipped - the world files in the bucket stay as they are until all units are built (all_regions, repeat), or partial_merge'
-              echo 'skip=true' >> "$GITHUB_OUTPUT"
-            fi
+            echo '::notice::merge skipped - the world files in the bucket stay as they are until all units are built (all_regions, repeat)'
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
           fi
       - name: Regional pieces of all units (releases osm-src-*)
         if: steps.cov.outputs.skip != 'true'
