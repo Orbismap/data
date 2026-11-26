@@ -16,6 +16,8 @@
 //   tippecanoe  extra tippecanoe arguments of the source's layer
 // Data © OpenStreetMap contributors (ODbL).
 
+import { NET_LAYERS, NET_VARIANTS } from './netzplan.mjs';
+
 /** OPL escapes unsafe characters as %hex% */
 const unescapeOpl = (v) => v.replace(/%([0-9a-f]+)%/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)));
 
@@ -50,22 +52,28 @@ export function parseOpl(line) {
 
 export const isCctv = (t) => t.man_made === 'surveillance' && t['surveillance:type'] !== 'ALPR' && !t.webcam && !t['contact:webcam'];
 
-/** One OPL line of an enforcement relation → { tags, members: [{ ref, role }] } or null. Only node members are kept. */
-export function parseEnforcement(line) {
+/** One OPL line of a relation → { id, tags, members: [{ type: 'n'|'w'|'r', ref, role }] } or null */
+export function parseRelation(line) {
   if (line.charCodeAt(0) !== 114 /* r */) return null;
-  let raw = '', mem = '';
+  let id, raw = '', mem = '';
   for (const f of line.split(' ')) {
-    if (f[0] === 'T') raw = f.slice(1);
+    if (f[0] === 'r' && id === undefined) id = f.slice(1);
+    else if (f[0] === 'T') raw = f.slice(1);
     else if (f[0] === 'M') mem = f.slice(1);
   }
-  const tags = parseTags(raw);
-  if (tags.type !== 'enforcement') return null;
   const members = [];
   for (const m of mem.split(',')) {
     const at = m.indexOf('@');
-    if (m[0] === 'n' && at > 1) members.push({ ref: m.slice(1, at), role: unescapeOpl(m.slice(at + 1)) });
+    if (at > 1) members.push({ type: m[0], ref: m.slice(1, at), role: unescapeOpl(m.slice(at + 1)) });
   }
-  return { tags, members };
+  return { id, tags: parseTags(raw), members };
+}
+
+/** One OPL line of an enforcement relation → { tags, members: [{ ref, role }] } or null. Only node members are kept. */
+export function parseEnforcement(line) {
+  const rel = parseRelation(line);
+  if (rel?.tags.type !== 'enforcement') return null;
+  return { tags: rel.tags, members: rel.members.filter((m) => m.type === 'n').map(({ ref, role }) => ({ ref, role })) };
 }
 
 /** One OPL line of a way → { id, tags, refs: node id strings } or null */
@@ -310,6 +318,19 @@ export const THEMES = {
     polygonFeature: roofFeature, tippecanoe: ['--no-clipping', '--no-duplication', '--no-tile-size-limit', '--no-feature-limit'],
   },
 };
+
+// Network plans (collectors/netzplan.mjs): one file per variant (netz-<variant>) with the layers lines, labels and stations. All nine
+// sources are computed together from the rail route relations of the first pass and the stop nodes of a second pass.
+for (const variant of Object.keys(NET_VARIANTS)) {
+  for (const layer of NET_LAYERS) {
+    THEMES[`netz_${variant}_${layer}`] = {
+      file: `netz-${variant}`, layer, variant, group: 'netz', geometry: 'netz', zoom: [6, 12],
+      filter: ['r/route=train,subway,light_rail,tram,monorail'],
+      // nothing is dropped: a missing line or station would tear a plan apart, and the rail network is thin enough
+      tippecanoe: ['-r1', '--no-feature-limit', '--no-tile-size-limit'],
+    };
+  }
+}
 
 /** the sources of one world file */
 export const sourcesOf = (file) => Object.entries(THEMES).filter(([, s]) => s.file === file).map(([id, s]) => ({ id, ...s }));

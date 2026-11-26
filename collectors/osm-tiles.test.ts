@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, parseRelation, parseEnforcement, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS } from './osm-tiles.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -78,7 +78,8 @@ describe('tree_lines layer', () => {
 describe('registry', () => {
   it('keeps the files, layers and fields the client reads', () => {
     expect(SETS).toEqual(['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'trees']);
-    expect(FILES).toEqual([...SETS, 'roofs']);
+    expect(FILES).toEqual([...SETS, 'roofs', 'netz-region', 'netz-stadt', 'netz-stadt-tram']);
+    expect(THEMES['netz_stadt-tram_stations']).toMatchObject({ file: 'netz-stadt-tram', layer: 'stations' });
     expect(FIELDS.cctv).toEqual(['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id']);
     expect(FIELDS.blitzer).toEqual(['dir', 'kind', 'speed', 'operator', 'ref', 'id']);
     expect(FIELDS.resource).toEqual(['name', 'kind', 'words', 'resource', 'operator', 'id']);
@@ -91,13 +92,27 @@ describe('registry', () => {
       expect(s.file && s.layer && s.group && s.filter?.length && s.zoom, id).toBeTruthy();
       if (s.geometry === 'point') expect(typeof s.match === 'function' && typeof s.record === 'function' && s.fields?.length, id).toBeTruthy();
       if (s.geometry === 'line') expect(typeof s.lineRecord === 'function' && typeof s.match === 'function', id).toBeTruthy();
+      if (s.geometry === 'netz') expect(s.variant, id).toBeTruthy();
       if (s.geometry === 'polygon') expect(typeof s.polygonFeature === 'function' && s.require?.length, id).toBeTruthy();
     }
   });
 
   it('roofs and trees are z15 only, the groups are the units of the two jobs', () => {
     expect(THEMES.roofs.zoom).toEqual([15, 15]);
-    expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'], trees: ['trees'], roofs: ['roofs'] });
+    expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'], trees: ['trees'], roofs: ['roofs'], netz: ['netz-region', 'netz-stadt', 'netz-stadt-tram'] });
+  });
+});
+
+describe('relations', () => {
+  it('parses the members of a relation line of OPL', () => {
+    const line = 'r5 v1 dV c1 t2020 i1 uu Ttype=route,route=tram,ref=1 Mn1@stop,w2@,n3@platform';
+    expect(parseRelation(line)).toEqual({
+      id: '5', tags: { type: 'route', route: 'tram', ref: '1' },
+      members: [{ type: 'n', ref: '1', role: 'stop' }, { type: 'w', ref: '2', role: '' }, { type: 'n', ref: '3', role: 'platform' }],
+    });
+    expect(parseEnforcement(line)).toBeNull();
+    expect(parseEnforcement('r6 Ttype=enforcement Mn7@device,w8@from')).toEqual({ tags: { type: 'enforcement' }, members: [{ ref: '7', role: 'device' }] });
+    expect(parseRelation('n1 x1 y2')).toBeNull();
   });
 });
 
@@ -227,7 +242,7 @@ describe('publish', () => {
   const write = (dir: string, name: string, part: object) => writeFileSync(join(dir, name), JSON.stringify(part));
   const parts = () => {
     const dir = mkdtempSync(join(tmpdir(), 'osm-parts-'));
-    write(dir, 'nodes.json', { groups: ['points', 'trees'], dataAt: t0 - 3600e3, files: { cctv: 'cctv-2026-12-02.pmtiles', trees: 'trees-2026-12-02.pmtiles' }, sets: { cctv: { bytes: 5, features: 2 }, trees: { bytes: 7, features: 3 } }, heatCells: { cctv: 4 } });
+    write(dir, 'nodes.json', { groups: ['points', 'trees', 'netz'], dataAt: t0 - 3600e3, files: { cctv: 'cctv-2026-12-02.pmtiles', trees: 'trees-2026-12-02.pmtiles' }, sets: { cctv: { bytes: 5, features: 2 }, trees: { bytes: 7, features: 3 } }, heatCells: { cctv: 4 } });
     write(dir, 'roofs.json', { groups: ['roofs'], dataAt: t0 - 7200e3, files: { roofs: 'roofs-2026-12-02.pmtiles' }, sets: { roofs: { bytes: 9, features: 1 } } });
     return dir;
   };

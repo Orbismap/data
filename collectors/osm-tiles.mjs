@@ -1,7 +1,8 @@
 // OpenStreetMap data of Orbis as PMTiles: one file per theme for the whole world in the bucket orbis-osm
 // (<theme>-<date>.pmtiles, named in meta.json). The themes are the registry in collectors/osm-themes.mjs (filter, fields, zoom,
 // geometry): cctv, blitzer, alpr, webcam, wind, resource (points, zoom 0-14), trees (single trees + the line layer `tree_lines`)
-// and roofs (buildings with roof tags as polygons), the last two z15 only.
+// and roofs (buildings with roof tags as polygons), the last two z15 only, and netz-region/-stadt/-stadt-tram (network plans of
+// the rail lines, zoom 6-12, collectors/netzplan.mjs).
 //
 // The build reads the PLANET (planet-latest.osm.pbf, ~90 GB, from a mirror) once per job; the themes are sparse, so what is kept is small:
 //   build [--groups points,trees] [--out dir] [--pbf file] [--part file] [--date YYYY-MM-DD]
@@ -13,8 +14,9 @@
 //                                          joins the part files of all jobs to <distDir>/meta.json (+ LICENSE.txt); the superseded versions
 //                                          go into meta.retired and, once the CDN cache time has passed (24 h), into the delete list;
 //                                          --manifest: the bucket's manifest.json is updated in place (new files in, deleted ones out)
-// Groups (GROUPS in the registry) are the units of work of the two jobs: `points` + `trees` read nodes (one streamed pass) and ways (second
-// pass), `roofs` reads ways and relations (osmium needs the file on disk for that, two passes). Data © OpenStreetMap contributors (ODbL).
+// Groups (GROUPS in the registry) are the units of work of the two jobs: `points` + `trees` + `netz` read nodes (one streamed pass, which
+// also hands over the relations) and then once more for the nodes of ways (tree lines) and of rail routes (netz), `roofs` reads ways and
+// relations (osmium needs the file on disk for that, two passes). Data © OpenStreetMap contributors (ODbL).
 
 import { execFileSync, spawn } from 'node:child_process';
 import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
@@ -22,9 +24,10 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { RULES } from './manifest.mjs';
-import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature } from './osm-themes.mjs';
+import { NET_VARIANTS, modeOf, netzplan, stopMembers } from './netzplan.mjs';
+import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature } from './osm-themes.mjs';
 
-export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature };
+export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature };
 
 /** the planet from these mirrors, in this order (measured 2026-11: gwdg ~145 MB/s, planet.openstreetmap.org ~45, fau ~27, bbbike ~10) */
 export const PLANET_MIRRORS = [
@@ -307,6 +310,45 @@ async function extractPolygons(dir, pbf, id, source) {
 }
 
 
+/**
+ * Network plans (geometry 'netz') as <dir>/<id>.geojsonl, one per source. Input: the rail route relations of the first pass. Second pass
+ * over the extract: only the nodes where those routes call (`osmium getid`; a regional extract misses some of them, that is not an error:
+ * exit code 1). Returns the number of features per source id.
+ */
+async function extractNetz(dir, pbf, relations, sources) {
+  const tmp = join(dir, 'netz-tmp');
+  mkdirSync(tmp, { recursive: true });
+  const idsFile = join(tmp, 'node-ids.txt'), nodesFile = join(tmp, 'nodes.opl');
+  const refs = new Set(relations.flatMap((r) => stopMembers(r).map((m) => m.ref)));
+  const ids = lineWriter(idsFile);
+  for (const r of refs) await ids.write(`n${r}`);
+  await ids.close();
+  const nodes = new Map();
+  if (refs.size) {
+    await sh(`${pbfInput(pbf)} | osmium getid --overwrite -F pbf -f opl -o "${nodesFile}" -i "${idsFile}" - || [ $? -eq 1 ]`);
+    for await (const line of createInterface({ input: createReadStream(nodesFile) })) {
+      const n = parseNode(line);
+      if (n) nodes.set(n.id, n);
+    }
+  }
+  console.log(`netz: ${relations.length} route relations, ${nodes.size} of ${refs.size} stop nodes`);
+  const counts = {};
+  for (const [variant, modes] of Object.entries(NET_VARIANTS)) {
+    const mine = sources.filter(([, s]) => s.variant === variant);
+    if (!mine.length) continue;
+    const plan = netzplan(relations, nodes, modes);
+    console.log(`netz ${variant}: ${plan.count} lines, ${plan.stations.length} stations`);
+    for (const [id, s] of mine) {
+      const out = lineWriter(join(dir, `${id}.geojsonl`));
+      for (const f of plan[s.layer]) await out.write(JSON.stringify(f));
+      await out.close();
+      counts[id] = plan[s.layer].length;
+    }
+  }
+  rmSync(tmp, { recursive: true, force: true });
+  return counts;
+}
+
 const entries = (geometry, groups) => Object.entries(THEMES).filter(([, s]) => s.geometry === geometry && groups.includes(s.group));
 
 /** writes the intermediates (GeoJSON lines per source) of the given groups to <outDir>/src/; `consume`: delete the planet after the last pass */
@@ -317,11 +359,13 @@ async function extract(pbf, outDir, { groups, consume = false }) {
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const t0 = Date.now();
-  const points = entries('point', groups), lines = entries('line', groups), polygons = entries('polygon', groups);
+  const points = entries('point', groups), lines = entries('line', groups), polygons = entries('polygon', groups), netz = entries('netz', groups);
+  /** rail route relations that appear on a plan (a few ten thousand worldwide) */
+  const routes = [];
   const counts = Object.fromEntries(Object.keys(THEMES).map((id) => [id, 0]));
   const pass1 = async () => {
-  // pass 1: nodes (points) and ways (their lines are built in pass 2), one streamed osmium run for all sources
-  const filter = [...new Set([...points, ...lines].flatMap(([, s]) => s.filter))].join(' ');
+  // pass 1: nodes (points), ways (their lines are built in pass 2) and relations (netz), one streamed osmium run for all sources
+  const filter = [...new Set([...points, ...lines, ...netz].flatMap(([, s]) => s.filter))].join(' ');
   const proc = spawn('bash', ['-c', `set -o pipefail; osmium tags-filter -R --input-format=pbf --output-format=opl --overwrite -o - "${pbf}" ${filter}`], { stdio: ['ignore', 'pipe', 'inherit'] });
   console.log(`${key}: filtering ${pbf}`);
   // listen before reading: a small extract can exit before the stream is drained, and a 'close' that was missed never resolves (Node then ends silently with exit 0)
@@ -339,7 +383,12 @@ async function extract(pbf, outDir, { groups, consume = false }) {
     }
     if (c === 114 /* r */) {
       const rel = parseEnforcement(line);
-      if (rel) for (const [id, s] of points) if (s.refine) s.refine(rel, deferred[id]);
+      if (rel) {
+        for (const [id, s] of points) if (s.refine) s.refine(rel, deferred[id]);
+      } else if (netz.length) {
+        const route = parseRelation(line);
+        if (modeOf(route.tags)) routes.push(route);
+      }
       continue;
     }
     const node = parseNode(line);
@@ -368,11 +417,12 @@ async function extract(pbf, outDir, { groups, consume = false }) {
     await once(w, 'finish');
   }
   };
-  if (points.length || lines.length) await timed('pass 1: nodes and ways of the themes (stream through the filter)', pass1);
+  if (points.length || lines.length || netz.length) await timed('pass 1: objects of the themes (stream through the filter)', pass1);
   for (const [id, s] of lines) {
     counts[id] = await timed(`lines ${id}: second pass over the planet`, () => extractLines(dir, pbf, join(dir, `ways-${id}.opl`), id, s));
     rmSync(join(dir, `ways-${id}.opl`), { force: true });
   }
+  if (netz.length) Object.assign(counts, await timed('netz: stop nodes (second pass over the planet) and plans', () => extractNetz(dir, pbf, routes, netz)));
   for (const [id, s] of polygons) counts[id] = await timed(`polygons ${id}: filter and export`, () => extractPolygons(dir, pbf, id, s));
   if (consume) rmSync(pbf, { force: true }); // the last pass over the planet is done: the disk is needed for the rest
   console.log(`${key}: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')} (${Math.round((Date.now() - t0) / 1000)} s)`);
@@ -470,7 +520,8 @@ async function buildWorld(srcDir, outDir, groups, counts, date) {
         await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
       }
     });
-    const features = counts[sources[0].id] ?? 0;
+    // the count of the file's main layer: the first one, for a network plan its stations
+    const features = counts[(sources.find((s) => s.layer === 'stations') ?? sources[0]).id] ?? 0;
     part.files[file] = name;
     part.sets[file] = { bytes: statSync(target).size, features, ...(sources.length > 1 ? { layers: Object.fromEntries(sources.map((s) => [s.layer, counts[s.id] ?? 0])) } : {}) };
     console.log(`${file}: ${part.sets[file].bytes} bytes, ${features} features`);
