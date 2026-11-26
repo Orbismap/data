@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
   "keep_vars": true, // schützt nur im Dashboard gesetzte Variablen, die NICHT in dieser Datei stehen
-  "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" },
+  "vars": { "ALLOWED_ORIGINS": "https://maltee.dev,https://bahn.maltee.dev,https://malte9799.github.io,http://localhost:5173,http://localhost:4173" },
   "triggers": { "crons": ["* * * * *"] },
   "d1_databases": [
     { "binding": "DB", "database_name": "orbis-push", "database_id": "aa4b53d8-a690-4130-81ec-a36b01dd2d11", "migrations_dir": "migrations" }
