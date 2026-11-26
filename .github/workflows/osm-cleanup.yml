@@ -1,0 +1,86 @@
+name: OSM cleanup
+
+# Löscht abgelöste Versionen der OSM-Dateien in orbis-osm (meta.retired), sobald die CDN-Cachezeit (24 h) vorbei ist. Der Planet-Lauf
+# kommt nur monatlich, ohne diesen Workflow lägen die alten Dateien (~1 GB) bis dahin im Bucket. Alle 6 h (und auf Anforderung):
+#   check    ohne Sperre: läuft oder wartet kein osm-planet, und ist etwas fällig? Sonst Ende, der nächste Lauf versucht es wieder.
+#            (GitHub hält je concurrency-Gruppe nur EINEN wartenden Lauf: ein wartender Aufräum-Job verdrängte einen wartenden
+#            Planet-Lauf. Deshalb geht nur in die Gruppe, wer wirklich etwas zu tun hat.)
+#   cleanup  in der Gruppe osm-planet (nie gleichzeitig mit einem Planet-Lauf): liest meta.json neu (S3, nicht das CDN), löscht
+#            (collectors/osm-cleanup.mjs: nie eine Datei aus meta.files), lädt manifest.json und zuletzt meta.json hoch. Bricht ein
+#            Schritt ab, stehen die Dateien noch in meta.retired und der nächste Lauf wiederholt alles (Löschen ist wiederholbar).
+
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # R2 versteht die neuen Prüfsummen-Header der AWS-CLI nicht
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_DEFAULT_REGION: auto
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      due: ${{ steps.due.outputs.due }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Anything due?
+        id: due
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo '::error::R2 credentials missing'
+            exit 1
+          fi
+          busy=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow osm-planet.yml --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$busy" != 0 ]; then echo '::notice::osm-planet is running or waiting - left for the next run'; exit 0; fi
+          aws s3 cp s3://orbis-osm/meta.json meta.json --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" --only-show-errors
+          node collectors/osm-cleanup.mjs meta.json delete.txt
+          if [ -s delete.txt ]; then echo 'due=true' >> "$GITHUB_OUTPUT"; fi
+
+  cleanup:
+    needs: check
+    if: needs.check.outputs.due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: osm-planet
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Delete superseded versions, then manifest.json and meta.json
+        run: |
+          EP="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3 cp s3://orbis-osm/meta.json meta.json --endpoint-url "$EP" --only-show-errors
+          aws s3 cp s3://orbis-osm/manifest.json manifest.json --endpoint-url "$EP" --only-show-errors
+          node collectors/osm-cleanup.mjs meta.json delete.txt manifest.json
+          [ -s delete.txt ] || { echo 'nothing to delete'; exit 0; }
+          while read -r key; do
+            echo "delete $key"
+            aws s3 rm "s3://orbis-osm/$key" --endpoint-url "$EP" --only-show-errors
+          done < delete.txt
+          aws s3 cp manifest.json s3://orbis-osm/manifest.json --endpoint-url "$EP" \
+            --cache-control "public, max-age=60, stale-while-revalidate=300" --content-type application/json --only-show-errors
+          aws s3 cp meta.json s3://orbis-osm/meta.json --endpoint-url "$EP" --cache-control "public, max-age=3600" --content-type application/json --only-show-errors
+          {
+            echo '### OSM cleanup'
+            sed 's/^/- deleted /' delete.txt
+          } >> "$GITHUB_STEP_SUMMARY"

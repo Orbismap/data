@@ -10,7 +10,7 @@ name: OSM planet
 #            dann fau), filtert, löscht den Planeten nach dem letzten Durchgang, baut mit tippecanoe die Welt-Dateien (<thema>-<datum>.pmtiles)
 #            und lädt sie nach orbis-osm (neue Namen: nichts Laufendes wird überschrieben). meta.json wird dabei NICHT angefasst.
 #   publish  nur wenn beide Jobs durch sind: führt deren Teil-Dateien zu meta.json zusammen (der Verweis, den die App liest), lädt sie als
-#            letztes hoch und löscht abgelöste Versionen, sobald die CDN-Cachezeit (24 h) vorbei ist. Scheitert ein Job, bleibt meta.json
+#            letztes hoch und löscht abgelöste Versionen, deren CDN-Cachezeit (24 h) vorbei ist (die gerade abgelösten: osm-cleanup.yml). Scheitert ein Job, bleibt meta.json
 #            und damit der Stand der App unverändert (die neuen Dateien liegen dann ungenutzt im Bucket, der nächste Lauf ersetzt sie).
 # In R2 liegen nur die fertigen Welt-Dateien (+ heat/cctv.json, meta.json, LICENSE.txt). R2-Zugangsdaten sind Pflicht.
 
