@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, parseRelation, parseEnforcement, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS, parkingRecord, parkingArea, ringCentre } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, parseRelation, parseEnforcement, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS, parkingRecord, parkingArea, ringCentre, parkingKeys, clusterPoints } from './osm-tiles.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -120,6 +120,27 @@ describe('fahrradparken', () => {
 
   it('keeps only bicycle parkings (osmium also exports what a relation refers to)', () => {
     expect(parkingArea({ properties: { building: 'yes' }, geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] } })).toBeNull();
+  });
+
+  it('counts a parking under every filter combination it passes', () => {
+    expect(parkingKeys({})).toEqual(['n', 'np']);
+    expect(parkingKeys({ access: 'private' })).toEqual(['n']);
+    expect(parkingKeys({ type: 'shed', capacity: 12 })).toEqual(['n', 'n5', 'n10', 'np', 'np5', 'np10', 'nc', 'nc5', 'nc10', 'ncp', 'ncp5', 'ncp10']);
+    expect(parkingKeys({ type: 'shed', covered: 'no', access: 'customers' })).toEqual(['n']);
+  });
+
+  it('clusters points per grid cell and zoom, outlines are not counted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'osm-cluster-'));
+    const point = (x: number, y: number, properties = {}) => JSON.stringify({ type: 'Feature', geometry: { type: 'Point', coordinates: [x, y] }, properties });
+    writeFileSync(join(dir, 'in.geojsonl'), [point(8, 50, { covered: 'yes' }), point(8.01, 50), point(-70, -30, { access: 'no' }),
+      JSON.stringify({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [[[8, 50], [8.1, 50], [8, 50.1], [8, 50]]] }, properties: {} })].join('\n'));
+    const counts = await clusterPoints([join(dir, 'in.geojsonl')], join(dir, 'out.geojsonl'), { cells: 6, keys: parkingKeys }, 2);
+    expect(counts).toEqual([2, 2]);
+    const made = readFileSync(join(dir, 'out.geojsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const europe = made.find((f) => f.tippecanoe.minzoom === 0 && f.geometry.coordinates[0] > 0);
+    expect(europe.properties).toEqual({ cluster: true, n: 2, np: 2, nc: 1, ncp: 1 });
+    expect(europe.geometry.coordinates).toEqual([8.005, 50]);
+    expect(made.find((f) => f.geometry.coordinates[0] < 0).properties).toEqual({ cluster: true, n: 1 });
   });
 
   it('centre of a degenerate ring is the mean of its corners', () => {

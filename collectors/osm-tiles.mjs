@@ -1,7 +1,7 @@
 // OpenStreetMap data of Orbis as PMTiles: one file per theme for the whole world in the bucket orbis-osm
 // (<theme>-<date>.pmtiles, named in meta.json). The themes are the registry in collectors/osm-themes.mjs (filter, fields, zoom,
 // geometry): cctv, blitzer, alpr, webcam, wind, resource (points, zoom 0-14), fahrradparken (bicycle parking: points for all,
-// outlines of the areas, zoom 10-14), trees (single trees + the line layer `tree_lines`)
+// outlines of the areas, zoom 10-14, clusters below), trees (single trees + the line layer `tree_lines`)
 // and roofs (buildings with roof tags as polygons), the last two z15 only, and netz-region/-stadt/-stadt-tram (network plans of
 // the rail lines, zoom 6-12, collectors/netzplan.mjs).
 //
@@ -26,9 +26,9 @@ import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { RULES } from './manifest.mjs';
 import { NET_VARIANTS, modeOf, netzplan, stopMembers } from './netzplan.mjs';
-import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, recordFeature, parkingRecord, parkingArea, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER } from './osm-themes.mjs';
+import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, recordFeature, parkingRecord, parkingArea, parkingKeys, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER, PARKING_STEPS } from './osm-themes.mjs';
 
-export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, parkingRecord, parkingArea, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER };
+export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, parkingRecord, parkingArea, parkingKeys, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER, PARKING_STEPS };
 
 /** the planet from these mirrors, in this order (measured 2026-11: gwdg ~145 MB/s, planet.openstreetmap.org ~45, fau ~27, bbbike ~10) */
 export const PLANET_MIRRORS = [
@@ -426,6 +426,57 @@ async function extract(pbf, outDir, { groups, consume = false }) {
 }
 
 
+/** Web-Mercator position of a lon/lat in the unit square (0,0 = north-west) */
+const mercator = (lon, lat) => {
+  const sin = Math.sin((Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI) / 180);
+  return [(lon + 180) / 360, 0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)];
+};
+/** index of the cell of an n x n grid over the unit square */
+const gridCell = (wx, wy, n) => Math.min(n - 1, Math.floor(wx * n)) * n + Math.min(n - 1, Math.floor(wy * n));
+
+/** the points [lon, lat] with their properties of the intermediates (other geometries are skipped) */
+async function* pointFeatures(files) {
+  for (const file of files) {
+    for await (const line of createInterface({ input: createReadStream(file), crlfDelay: Infinity })) {
+      if (!line) continue;
+      const f = JSON.parse(line);
+      if (f.geometry?.type === 'Point') yield f;
+    }
+  }
+}
+
+/**
+ * Clusters for the zooms below `end`: per zoom one point per cell of a `cells` x `cells` grid of each tile, at the mean position of
+ * its points, with the property `cluster: true` and a counter per key of `keys(properties)` (counters at 0 are left out). Written as
+ * newline-delimited GeoJSON with `tippecanoe: {minzoom: z, maxzoom: z}`. Returns the number of clusters per zoom.
+ */
+export async function clusterPoints(files, outFile, { cells, keys }, end) {
+  const grids = Array.from({ length: end }, () => new Map());
+  for await (const { geometry, properties } of pointFeatures(files)) {
+    const [wx, wy] = mercator(...geometry.coordinates);
+    const counted = keys(properties);
+    grids.forEach((grid, z) => {
+      const cell = gridCell(wx, wy, 2 ** z * cells);
+      let c = grid.get(cell);
+      if (!c) grid.set(cell, (c = { x: 0, y: 0, size: 0, counts: {} }));
+      c.x += wx;
+      c.y += wy;
+      c.size++;
+      for (const k of counted) c.counts[k] = (c.counts[k] ?? 0) + 1;
+    });
+  }
+  const out = lineWriter(outFile);
+  const deg = (v) => Math.round(v * 1e5) / 1e5;
+  for (const [z, grid] of grids.entries()) {
+    for (const { x, y, size, counts } of grid.values()) {
+      const lon = deg((x / size) * 360 - 180), lat = deg((Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / size))) * 180) / Math.PI);
+      await out.write(JSON.stringify({ type: 'Feature', tippecanoe: { minzoom: z, maxzoom: z }, geometry: { type: 'Point', coordinates: [lon, lat] }, properties: { cluster: true, ...counts } }));
+    }
+  }
+  await out.close();
+  return grids.map((g) => g.size);
+}
+
 /**
  * Attribute-free copy of the points for the low zooms: for each zoom z < LOW_ZOOM_END one point per LOW_GRID cell of a
  * tile (Web-Mercator), written as newline-delimited GeoJSON with `tippecanoe: {layer, minzoom: z, maxzoom: z}`.
@@ -435,23 +486,15 @@ export async function lowZoomPoints(files, set, outFile) {
   const out = createWriteStream(outFile);
   const seen = Array.from({ length: LOW_ZOOM_END }, () => new Set());
   const counts = new Array(LOW_ZOOM_END).fill(0);
-  for (const file of files) {
-    for await (const line of createInterface({ input: createReadStream(file), crlfDelay: Infinity })) {
-      if (!line) continue;
-      const c = JSON.parse(line).geometry?.coordinates;
-      if (!c) continue;
-      const [lon, lat] = c;
-      const wx = (lon + 180) / 360;
-      const sin = Math.sin((Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI) / 180);
-      const wy = 0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI);
-      for (let z = 0; z < LOW_ZOOM_END; z++) {
-        const n = 2 ** z * LOW_GRID;
-        const key = Math.min(n - 1, Math.floor(wx * n)) * n + Math.min(n - 1, Math.floor(wy * n));
-        if (seen[z].has(key)) continue;
-        seen[z].add(key);
-        counts[z]++;
-        if (!out.write(`{"type":"Feature","tippecanoe":{"layer":"${set}_lo","minzoom":${z},"maxzoom":${z}},"geometry":{"type":"Point","coordinates":[${lon},${lat}]},"properties":{}}\n`)) await once(out, 'drain');
-      }
+  for await (const { geometry } of pointFeatures(files)) {
+    const [lon, lat] = geometry.coordinates;
+    const [wx, wy] = mercator(lon, lat);
+    for (let z = 0; z < LOW_ZOOM_END; z++) {
+      const key = gridCell(wx, wy, 2 ** z * LOW_GRID);
+      if (seen[z].has(key)) continue;
+      seen[z].add(key);
+      counts[z]++;
+      if (!out.write(`{"type":"Feature","tippecanoe":{"layer":"${set}_lo","minzoom":${z},"maxzoom":${z}},"geometry":{"type":"Point","coordinates":[${lon},${lat}]},"properties":{}}\n`)) await once(out, 'drain');
     }
   }
   out.end();
@@ -501,20 +544,23 @@ async function buildWorld(srcDir, outDir, groups, counts, date) {
     const target = join(outDir, name);
     const [zMin, zMax] = sources[0].zoom;
     const label = ['-n', file, '-N', `OpenStreetMap ${file}`];
+    // what replaces the records at low zooms: camera sets show one bare point per grid cell below LOW_ZOOM_END (layer <set>_lo),
+    // sets with `clusters` counted clusters below their first zoom (layer <set>_cluster)
+    const paths = inputs.map((s) => s.path);
+    const { low, clusters } = sources[0];
+    const overview = low ? { layer: `${file}_lo`, end: LOW_ZOOM_END, write: (to) => lowZoomPoints(paths, file, to) }
+      : clusters ? { layer: `${file}_cluster`, end: zMin, write: (to) => clusterPoints(paths, to, clusters, zMin) } : null;
+    // one file, one layer per source (-L name:file), all at the zoom of the records
+    const records = (to, from) => run('tippecanoe', ['-o', to, '-Z', String(from), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
     await timed(`tippecanoe ${file}`, async () => {
-      if (sources[0].low) {
-        // Camera sets: z0..LOW_ZOOM_END-1 only one bare point per grid cell (layer <set>_lo, lowZoomPoints), nothing dropped;
-        // from LOW_ZOOM_END the full records (layer <set>); tile-join puts both zoom ranges into one file
-        const lo = join(srcDir, `${file}-lo`), hi = join(srcDir, `${file}-hi`);
-        await lowZoomPoints(inputs.map((s) => s.path), file, `${lo}.geojsonl`);
-        await run('tippecanoe', ['-o', `${lo}.pmtiles`, '-l', `${file}_lo`, '-Z', '0', '-z', String(LOW_ZOOM_END - 1), '--no-feature-limit', '--no-tile-size-limit', '-r1', '-b', '0', ...label, ...common, `${lo}.geojsonl`]);
-        await run('tippecanoe', ['-o', `${hi}.pmtiles`, '-l', file, '-Z', String(LOW_ZOOM_END), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.map((s) => s.path)]);
-        await run('tile-join', ['-o', target, '--force', '-pk', '-q', ...label, '-A', ATTRIBUTION, `${lo}.pmtiles`, `${hi}.pmtiles`]);
-        for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${hi}.pmtiles`]) rmSync(f, { force: true });
-      } else {
-        // one file, one layer per source (-L name:file), all at the zoom of the file
-        await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
-      }
+      if (!overview) return records(target, zMin);
+      // two zoom ranges, nothing dropped from the overview; tile-join puts them into one file
+      const lo = join(srcDir, `${file}-lo`), hi = join(srcDir, `${file}-hi`);
+      await overview.write(`${lo}.geojsonl`);
+      await run('tippecanoe', ['-o', `${lo}.pmtiles`, '-l', overview.layer, '-Z', '0', '-z', String(overview.end - 1), '--no-feature-limit', '--no-tile-size-limit', '-r1', '-b', '0', ...label, ...common, `${lo}.geojsonl`]);
+      await records(`${hi}.pmtiles`, Math.max(zMin, overview.end));
+      await run('tile-join', ['-o', target, '--force', '-pk', '-q', ...label, '-A', ATTRIBUTION, `${lo}.pmtiles`, `${hi}.pmtiles`]);
+      for (const f of [`${lo}.geojsonl`, `${lo}.pmtiles`, `${hi}.pmtiles`]) rmSync(f, { force: true });
     });
     // objects per layer (several sources may fill one: bicycle parking as nodes and as areas)
     const layers = {};

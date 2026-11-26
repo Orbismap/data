@@ -14,7 +14,8 @@
 //   record / lineRecord / polygonFeature   tags (+ geometry) -> record / GeoJSON feature (polygonFeature: one or an array;
 //             `attributes`: object attributes osmium export adds to the properties, e.g. 'type,id')
 //   fields    property names of a point record after [lon, lat] (FIELDS)
-//   zoom      [min, max] of the pmtiles; low: below LOW_ZOOM_END only an attribute-free layer `<layer>_lo` (see lowZoomPoints)
+//   zoom      [min, max] of the pmtiles; low: below LOW_ZOOM_END only an attribute-free layer `<layer>_lo` (see lowZoomPoints);
+//             clusters ({ cells, keys }): below `min` a layer `<layer>_cluster` with counted points (see clusterPoints)
 //   tippecanoe  extra tippecanoe arguments of the source's layer
 // Data © OpenStreetMap contributors (ODbL).
 
@@ -314,6 +315,30 @@ export function parkingRecord({ id, x, y, tags: t }, osm = '') {
     oneOf(t.fee, ['yes', 'no']), oneOf(t.lit, ['yes', 'no']), cargo, short(t.operator, 80), short(t.name, 80), osm, Number(id)];
 }
 
+/** `bicycle_parking` types that are roofed by their nature (covered unless `covered` says otherwise) */
+const ROOFED = ['building', 'shed', 'lockers'];
+/** `access` values (and none) with which anybody may park */
+const PUBLIC_ACCESS = ['yes', 'public', 'permissive', 'designated'];
+/** the minimum numbers of places the app offers as a filter */
+export const PARKING_STEPS = [5, 10, 20, 50];
+
+/**
+ * The counters of a cluster a parking (properties of its point feature) counts for: `n` = all, `c` = covered, `p` = public, a number
+ * = at least that many places, combined in this order (`n`, `nc`, `ncp10` …). One counter per combination of the app's filters, so
+ * a filtered map shows exact numbers. The app has the same rules (orbis-map, src/data/bikeparking.ts): change both together.
+ */
+export function parkingKeys({ type, capacity, covered, access }) {
+  const roofed = covered === 'yes' || (covered === undefined && ROOFED.includes(type));
+  const open = access === undefined || PUBLIC_ACCESS.includes(access);
+  const keys = [];
+  for (const c of roofed ? ['', 'c'] : ['']) {
+    for (const p of open ? ['', 'p'] : ['']) {
+      for (const step of ['', ...PARKING_STEPS.filter((s) => capacity >= s)]) keys.push(`n${c}${p}${step}`);
+    }
+  }
+  return keys;
+}
+
 /** area-weighted centre of a closed ring [lon, lat][]; the mean of its corners when it has no area */
 export function ringCentre(ring) {
   const [x0, y0] = ring[0];
@@ -360,8 +385,11 @@ const POINT_RES = { geometry: 'point', zoom: [0, 14], tippecanoe: ['--drop-dense
 const RESOURCE_MAN_MADE = ['petroleum_well', 'pumpjack', 'mineshaft', 'adit'];
 const RESOURCE_INDUSTRIAL = ['mine', 'oil', 'gas', 'refinery'];
 
-/** bicycle parking from zoom 10 (a world view of a million racks says nothing and would double the file); outlines are neither clipped nor reduced */
-const PARKING_RES = { zoom: [10, 14], tippecanoe: [...POINT_RES.tippecanoe, '--no-clipping', '--no-tiny-polygon-reduction'] };
+/**
+ * bicycle parking: single objects from zoom 10 (all of a million racks in the world view would double the file), below that clusters
+ * (a grid of 6 x 6 cells per tile); outlines are neither clipped nor reduced
+ */
+const PARKING_RES = { zoom: [10, 14], tippecanoe: [...POINT_RES.tippecanoe, '--no-clipping', '--no-tiny-polygon-reduction'], clusters: { cells: 6, keys: parkingKeys } };
 
 /** the themes (see the head of the file); the key is the source id = name of its intermediate <id>.geojsonl */
 export const THEMES = {
