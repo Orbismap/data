@@ -1,10 +1,10 @@
 name: OSM planet
 
-# OSM-Daten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Bäume, Dächer, Netzpläne) als PMTiles, eine Datei je Thema weltweit
+# OSM-Daten (Kameras/CCTV, Blitzer, ALPR, Webcams, Windräder, Ressourcen, Fahrradparkplätze, Bäume, Dächer, Netzpläne) als PMTiles, eine Datei je Thema weltweit
 # (collectors/osm-tiles.mjs, Themen-Registry collectors/osm-themes.mjs). Läuft einmal im Monat (1. um 03:17 UTC) und auf Anforderung.
 #   build    zwei Jobs parallel, je eigene Platte (der Planet ist ~90 GB, der Runner hat nach dem Aufräumen ~110 GB):
 #              nodes = Gruppen points + trees + netz (Punkte und Linien-Relationen in einem gestreamten Durchgang, je ein weiterer
-#                      für die Knoten der Baumreihen/Hecken und der Haltepunkte)
+#                      für die Knoten der Baumreihen/Hecken und der Haltepunkte, dazu die Flächen der Fahrradparkplätze)
 #              roofs = Gruppe roofs (osmium braucht die Datei auf der Platte, zwei Durchgänge)
 #            Jeder Job lädt den Planeten (planet-latest.osm.pbf) vom ersten Mirror, der geht (gwdg ~145 MB/s, dann planet.openstreetmap.org,
 #            dann fau), filtert, löscht den Planeten nach dem letzten Durchgang, baut mit tippecanoe die Welt-Dateien (<thema>-<datum>.pmtiles)
