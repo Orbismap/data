@@ -5,12 +5,14 @@
 //   file      name of the world PMTiles it goes into (<file>-<date>.pmtiles in the bucket); several sources may share a file
 //             (trees: layers `trees` and `tree_lines`)
 //   layer     layer name inside the file
-//   group     which job builds it (osm-planet.yml): points + trees = the node job, roofs = the roofs job (osmium needs the planet on disk for polygons)
+//   group     which job builds it (osm-planet.yml): points + trees + netz = the node job, roofs = the roofs job (its filter takes so
+//             much disk that it has a runner of its own)
 //   geometry  'point' (OSM nodes, streamed once), 'line' (ways: node refs from the stream, positions fetched in a second pass)
 //             or 'polygon' (buildings etc.: osmium export builds the areas)
-//   filter    osmium tags-filter expressions of the first pass (OR); polygons additionally `require` (AND, second filter)
+//   filter    osmium tags-filter expressions of the first pass (OR); polygons optionally `require` (AND, second filter)
 //   match     (tags) => boolean, which of the filtered objects belong to the theme (points, lines)
-//   record / lineRecord / polygonFeature   tags (+ geometry) -> record / GeoJSON feature
+//   record / lineRecord / polygonFeature   tags (+ geometry) -> record / GeoJSON feature (polygonFeature: one or an array;
+//             `attributes`: object attributes osmium export adds to the properties, e.g. 'type,id')
 //   fields    property names of a point record after [lon, lat] (FIELDS)
 //   zoom      [min, max] of the pmtiles; low: below LOW_ZOOM_END only an attribute-free layer `<layer>_lo` (see lowZoomPoints)
 //   tippecanoe  extra tippecanoe arguments of the source's layer
@@ -90,6 +92,19 @@ export function parseWay(line) {
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
+
+/** default of a field (left out of the file): direction -1, flags 0, everything else '' (id, where a set has one, is always present) */
+export const fieldDefault = (f) => (f === 'dir' ? -1 : f === 'guard' || f === 'flock' || f === 'panning' || f === 'cargo' ? 0 : '');
+
+/** a record [lon, lat, …fields] as GeoJSON point feature (numbers stay numbers; '' = not tagged = left out) */
+export function recordFeature(fields, rec) {
+  const props = {};
+  fields.forEach((f, i) => {
+    const v = rec[i + 2];
+    if (f === 'id' || v !== fieldDefault(f)) props[f] = v;
+  });
+  return { type: 'Feature', geometry: { type: 'Point', coordinates: [rec[0], rec[1]] }, properties: props };
+}
 
 /** Blitzer tile record: [lon, lat, direction°|-1, kind 'cam'|'section'|'signals', maxspeed, operator, ref, OSM node id] */
 export function speedRecord({ id, x, y, tags }) {
@@ -279,6 +294,57 @@ export function roofFeature(f) {
   return { type: 'Feature', geometry: { type: 'MultiPolygon', coordinates: polys }, properties: props };
 }
 
+// --- bicycle parking -----------------------------------------------------------------------------------------------------
+
+export const PARKING_FIELDS = ['type', 'capacity', 'covered', 'access', 'fee', 'lit', 'cargo', 'operator', 'name', 'osm', 'id'];
+/** layer of the outlines in fahrradparken.pmtiles (the points are in the layer `fahrradparken`) */
+export const PARKING_AREA_LAYER = 'fahrradparken_flaechen';
+
+/** free text of a tag, '' when missing or longer than `max` */
+const short = (v, max = 40) => (v !== undefined && v.trim().length <= max ? v.trim() : '');
+
+/**
+ * bicycle parking record: [lon, lat, type (bicycle_parking=*), capacity, covered, access, fee, lit, cargo 0|1, operator, name,
+ * osm ''|'w'|'r' ('' = node), OSM id]
+ */
+export function parkingRecord({ id, x, y, tags: t }, osm = '') {
+  const capacity = /^\d{1,5}$/.test(t.capacity ?? '') ? Number(t.capacity) : 0;
+  const cargo = Number(t['capacity:cargo_bike']) > 0 || t['capacity:cargo_bike'] === 'yes' || ['yes', 'designated'].includes(t.cargo_bike) ? 1 : 0;
+  return [r5(x), r5(y), short(t.bicycle_parking), capacity || '', oneOf(t.covered, ['yes', 'no', 'partial']), short(t.access),
+    oneOf(t.fee, ['yes', 'no']), oneOf(t.lit, ['yes', 'no']), cargo, short(t.operator, 80), short(t.name, 80), osm, Number(id)];
+}
+
+/** area-weighted centre of a closed ring [lon, lat][]; the mean of its corners when it has no area */
+export function ringCentre(ring) {
+  const [x0, y0] = ring[0];
+  let area = 0, cx = 0, cy = 0;
+  for (let i = 0; i < ring.length - 1; i++) {
+    const ax = ring[i][0] - x0, ay = ring[i][1] - y0, bx = ring[i + 1][0] - x0, by = ring[i + 1][1] - y0;
+    const k = ax * by - bx * ay;
+    area += k;
+    cx += (ax + bx) * k;
+    cy += (ay + by) * k;
+  }
+  if (Math.abs(area) > 1e-14) return [x0 + cx / (3 * area), y0 + cy / (3 * area)];
+  const corners = ring.slice(0, -1);
+  return [0, 1].map((d) => corners.reduce((sum, c) => sum + c[d], 0) / corners.length);
+}
+
+/**
+ * A bicycle parking mapped as an area (`osmium export -a type,id`): [point, outline], both with the same properties, or null. The
+ * point goes into the same layer as the parkings mapped as nodes (so the app reads one layer for all), the outline (zoom 14 only)
+ * into PARKING_AREA_LAYER. A multipolygon with several parts gets its point in the first one.
+ */
+export function parkingArea(f) {
+  const t = f.properties ?? {}, g = f.geometry;
+  if (t.amenity !== 'bicycle_parking' || (g?.type !== 'Polygon' && g?.type !== 'MultiPolygon')) return null;
+  const [x, y] = ringCentre((g.type === 'Polygon' ? g.coordinates : g.coordinates[0])[0]);
+  const point = recordFeature(PARKING_FIELDS, parkingRecord({ id: t['@id'], x, y, tags: t }, t['@type'] === 'relation' ? 'r' : 'w'));
+  const round = (c) => (typeof c[0] === 'number' ? [r6(c[0]), r6(c[1])] : c.map(round));
+  const outline = { type: 'Feature', tippecanoe: { layer: PARKING_AREA_LAYER, minzoom: 14 }, geometry: { type: g.type, coordinates: round(g.coordinates) }, properties: point.properties };
+  return [point, outline];
+}
+
 // --- the registry --------------------------------------------------------------------------------------------------------
 
 /** refines the kind of speed cameras by their enforcement relations (relations come after all nodes in the stream) */
@@ -294,6 +360,9 @@ const POINT_RES = { geometry: 'point', zoom: [0, 14], tippecanoe: ['--drop-dense
 const RESOURCE_MAN_MADE = ['petroleum_well', 'pumpjack', 'mineshaft', 'adit'];
 const RESOURCE_INDUSTRIAL = ['mine', 'oil', 'gas', 'refinery'];
 
+/** bicycle parking from zoom 10 (a world view of a million racks says nothing and would double the file); outlines are neither clipped nor reduced */
+const PARKING_RES = { zoom: [10, 14], tippecanoe: [...POINT_RES.tippecanoe, '--no-clipping', '--no-tiny-polygon-reduction'] };
+
 /** the themes (see the head of the file); the key is the source id = name of its intermediate <id>.geojsonl */
 export const THEMES = {
   cctv: { ...POINT_RES, file: 'cctv', layer: 'cctv', group: 'points', low: true, heat: true, filter: ['n/man_made=surveillance'], match: isCctv, record, fields: ['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id'] },
@@ -307,6 +376,9 @@ export const THEMES = {
     match: (t) => RESOURCE_MAN_MADE.includes(t.man_made) || RESOURCE_INDUSTRIAL.includes(t.industrial) || t.landuse === 'quarry',
     record: resourceRecord, fields: ['name', 'kind', 'words', 'resource', 'operator', 'id'],
   },
+  // bicycle parking: nodes from the stream, areas (ways and multipolygons) through osmium export; both in the layer `fahrradparken`
+  fahrradparken: { ...POINT_RES, ...PARKING_RES, file: 'fahrradparken', layer: 'fahrradparken', group: 'points', filter: ['n/amenity=bicycle_parking'], match: (t) => t.amenity === 'bicycle_parking', record: parkingRecord, fields: PARKING_FIELDS },
+  fahrradparken_areas: { ...PARKING_RES, geometry: 'polygon', file: 'fahrradparken', layer: 'fahrradparken', group: 'points', filter: ['w/amenity=bicycle_parking', 'r/amenity=bicycle_parking'], attributes: 'type,id', polygonFeature: parkingArea },
   // single trees for the 3D view, z15 only (the map overzooms it; z16 would store every tree twice); no id (the position is enough), no genus (the app derives it from species)
   trees: { ...POINT_RES, zoom: [15, 15], file: 'trees', layer: 'trees', group: 'trees', filter: ['n/natural=tree'], match: (t) => t.natural === 'tree', record: treeRecord, fields: ['species', 'height', 'circumference', 'leaf_type', 'leaf_cycle'] },
   // second layer of trees.pmtiles: rows of trees and hedges as lines

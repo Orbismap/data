@@ -1,6 +1,7 @@
 // OpenStreetMap data of Orbis as PMTiles: one file per theme for the whole world in the bucket orbis-osm
 // (<theme>-<date>.pmtiles, named in meta.json). The themes are the registry in collectors/osm-themes.mjs (filter, fields, zoom,
-// geometry): cctv, blitzer, alpr, webcam, wind, resource (points, zoom 0-14), trees (single trees + the line layer `tree_lines`)
+// geometry): cctv, blitzer, alpr, webcam, wind, resource (points, zoom 0-14), fahrradparken (bicycle parking: points for all,
+// outlines of the areas, zoom 10-14), trees (single trees + the line layer `tree_lines`)
 // and roofs (buildings with roof tags as polygons), the last two z15 only, and netz-region/-stadt/-stadt-tram (network plans of
 // the rail lines, zoom 6-12, collectors/netzplan.mjs).
 //
@@ -15,8 +16,8 @@
 //                                          go into meta.retired and, once the CDN cache time has passed (24 h), into the delete list;
 //                                          --manifest: the bucket's manifest.json is updated in place (new files in, deleted ones out)
 // Groups (GROUPS in the registry) are the units of work of the two jobs: `points` + `trees` + `netz` read nodes (one streamed pass, which
-// also hands over the relations) and then once more for the nodes of ways (tree lines) and of rail routes (netz), `roofs` reads ways and
-// relations (osmium needs the file on disk for that, two passes). Data © OpenStreetMap contributors (ODbL).
+// also hands over the relations) and then once more for the nodes of ways (tree lines) and of rail routes (netz); polygons (the areas of
+// fahrradparken, `roofs`) need ways, relations and their nodes (osmium needs the file on disk for that, several passes). Data © OpenStreetMap contributors (ODbL).
 
 import { execFileSync, spawn } from 'node:child_process';
 import { copyFileSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
@@ -25,9 +26,9 @@ import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { RULES } from './manifest.mjs';
 import { NET_VARIANTS, modeOf, netzplan, stopMembers } from './netzplan.mjs';
-import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature } from './osm-themes.mjs';
+import { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, recordFeature, parkingRecord, parkingArea, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER } from './osm-themes.mjs';
 
-export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature };
+export { THEMES, FILES, GROUPS, sourcesOf, lineFeature, treeLineRecord, parseNode, parseWay, parseRelation, parseEnforcement, metres, simplify, treeRecord, record, speedRecord, alprRecord, webcamRecord, windRecord, resourceRecord, LINE_FIELDS, LINE_TOLERANCE, ROOF_KEEP, ROOF_TAGS, roofFeature, fieldDefault, parkingRecord, parkingArea, ringCentre, PARKING_FIELDS, PARKING_AREA_LAYER };
 
 /** the planet from these mirrors, in this order (measured 2026-11: gwdg ~145 MB/s, planet.openstreetmap.org ~45, fau ~27, bbbike ~10) */
 export const PLANET_MIRRORS = [
@@ -61,18 +62,8 @@ export const LOW_SETS = FILES.filter((f) => sourcesOf(f).some((s) => s.low));
 export const LOW_ZOOM_END = 6; // first zoom of the full layer; the `_lo` layer covers 0 .. LOW_ZOOM_END - 1
 export const LOW_GRID = 1024;
 
-/** default of a field (left out of the file): direction -1, flags 0, everything else '' (id, where a set has one, is always present) */
-export const fieldDefault = (f) => (f === 'dir' ? -1 : f === 'guard' || f === 'flock' || f === 'panning' ? 0 : '');
-
-/** a record [lon, lat, …FIELDS[set]] as GeoJSON point feature (numbers stay numbers; '' = not tagged = left out) */
-export function toFeature(set, rec) {
-  const props = {};
-  FIELDS[set].forEach((f, i) => {
-    const v = rec[i + 2];
-    if (f === 'id' || v !== fieldDefault(f)) props[f] = v;
-  });
-  return { type: 'Feature', geometry: { type: 'Point', coordinates: [rec[0], rec[1]] }, properties: props };
-}
+/** a record of the point source `set` as GeoJSON feature */
+export const toFeature = (set, rec) => recordFeature(FIELDS[set], rec);
 
 /** appends lines to a file with backpressure */
 function lineWriter(path) {
@@ -283,25 +274,30 @@ async function extractLines(dir, pbf, waysFile, id, source) {
 
 
 /**
- * Polygons (buildings with a roof tag …) as <dir>/<id>.geojsonl: osmium tags-filter keeps the objects with the source's tags (first
- * `filter`, OR) that also have one of `require` (second filter, AND) plus what they refer to; osmium export assembles the areas
- * (closed ways and multipolygon relations). Offline per file, one pass each. Returns the number of features written.
+ * Polygons (buildings with a roof tag, areas of bicycle parkings …) as <dir>/<id>.geojsonl: osmium tags-filter keeps the objects with
+ * the source's tags (`filter`, OR) plus what they refer to, with `require` only those that also have one of these (second filter, AND);
+ * osmium export assembles the areas (closed ways and multipolygon relations). Offline per file, one pass each. Returns the number of
+ * areas written (polygonFeature may make several features of one).
  */
 async function extractPolygons(dir, pbf, id, source) {
   const tmp = join(dir, `polygons-tmp-${id}`);
   mkdirSync(tmp, { recursive: true });
   const [s1, s2, raw] = ['s1.osm.pbf', 's2.osm.pbf', 'areas.geojsonseq'].map((f) => join(tmp, f));
   await sh(`osmium tags-filter --overwrite -o "${s1}" "${pbf}" ${source.filter.join(' ')}`);
-  await sh(`osmium tags-filter --overwrite -o "${s2}" "${s1}" ${source.require.join(' ')}`);
-  rmSync(s1, { force: true });
-  await sh(`osmium export --overwrite -i sparse_file_array,"${join(tmp, 'locations.idx')}" --geometry-types=polygon -f geojsonseq -x print_record_separator=false -o "${raw}" "${s2}"`);
-  rmSync(s2, { force: true });
+  if (source.require) {
+    await sh(`osmium tags-filter --overwrite -o "${s2}" "${s1}" ${source.require.join(' ')}`);
+    rmSync(s1, { force: true });
+  }
+  const filtered = source.require ? s2 : s1;
+  const attributes = source.attributes ? `-a ${source.attributes}` : '';
+  await sh(`osmium export --overwrite -i sparse_file_array,"${join(tmp, 'locations.idx')}" ${attributes} --geometry-types=polygon -f geojsonseq -x print_record_separator=false -o "${raw}" "${filtered}"`);
+  rmSync(filtered, { force: true });
   const out = lineWriter(join(dir, `${id}.geojsonl`));
   let n = 0;
   for await (const f of geojsonLines(raw)) {
-    const feat = source.polygonFeature(f);
-    if (!feat) continue;
-    await out.write(JSON.stringify(feat));
+    const made = source.polygonFeature(f);
+    if (!made) continue;
+    for (const feat of [made].flat()) await out.write(JSON.stringify(feat));
     n++;
   }
   await out.close();
@@ -520,10 +516,13 @@ async function buildWorld(srcDir, outDir, groups, counts, date) {
         await run('tippecanoe', ['-o', target, '-Z', String(zMin), '-z', String(zMax), ...sources[0].tippecanoe, ...label, ...common, ...inputs.flatMap((s) => ['-L', `${s.layer}:${s.path}`])]);
       }
     });
+    // objects per layer (several sources may fill one: bicycle parking as nodes and as areas)
+    const layers = {};
+    for (const s of sources) layers[s.layer] = (layers[s.layer] ?? 0) + (counts[s.id] ?? 0);
     // the count of the file's main layer: the first one, for a network plan its stations
-    const features = counts[(sources.find((s) => s.layer === 'stations') ?? sources[0]).id] ?? 0;
+    const features = layers.stations ?? layers[sources[0].layer];
     part.files[file] = name;
-    part.sets[file] = { bytes: statSync(target).size, features, ...(sources.length > 1 ? { layers: Object.fromEntries(sources.map((s) => [s.layer, counts[s.id] ?? 0])) } : {}) };
+    part.sets[file] = { bytes: statSync(target).size, features, ...(Object.keys(layers).length > 1 ? { layers } : {}) };
     console.log(`${file}: ${part.sets[file].bytes} bytes, ${features} features`);
   }
   for (const [id, s] of Object.entries(THEMES)) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs collector
-import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, parseRelation, parseEnforcement, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS } from './osm-tiles.mjs';
+import { FIELDS, LINES, lineFeature, metres, parseNode, parseWay, parseRelation, parseEnforcement, simplify, toFeature, treeLineRecord, treeRecord, SET_ZOOM, SETS, FILES, GROUPS, THEMES, FORMAT, retireVersions, roofFeature, retryAfterSeconds, backoffMs, download, downloadFirst, MirrorUnreachable, publish, PLANET_MIRRORS, parkingRecord, parkingArea, ringCentre } from './osm-tiles.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -77,7 +77,7 @@ describe('tree_lines layer', () => {
 
 describe('registry', () => {
   it('keeps the files, layers and fields the client reads', () => {
-    expect(SETS).toEqual(['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'trees']);
+    expect(SETS).toEqual(['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'fahrradparken', 'trees']);
     expect(FILES).toEqual([...SETS, 'roofs', 'netz-region', 'netz-stadt', 'netz-stadt-tram']);
     expect(THEMES['netz_stadt-tram_stations']).toMatchObject({ file: 'netz-stadt-tram', layer: 'stations' });
     expect(FIELDS.cctv).toEqual(['dir', 'surveillance', 'ctype', 'mount', 'guard', 'operator', 'id']);
@@ -93,13 +93,37 @@ describe('registry', () => {
       if (s.geometry === 'point') expect(typeof s.match === 'function' && typeof s.record === 'function' && s.fields?.length, id).toBeTruthy();
       if (s.geometry === 'line') expect(typeof s.lineRecord === 'function' && typeof s.match === 'function', id).toBeTruthy();
       if (s.geometry === 'netz') expect(s.variant, id).toBeTruthy();
-      if (s.geometry === 'polygon') expect(typeof s.polygonFeature === 'function' && s.require?.length, id).toBeTruthy();
+      if (s.geometry === 'polygon') expect(typeof s.polygonFeature === 'function', id).toBeTruthy();
     }
   });
 
   it('roofs and trees are z15 only, the groups are the units of the two jobs', () => {
     expect(THEMES.roofs.zoom).toEqual([15, 15]);
-    expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource'], trees: ['trees'], roofs: ['roofs'], netz: ['netz-region', 'netz-stadt', 'netz-stadt-tram'] });
+    expect(GROUPS).toEqual({ points: ['cctv', 'blitzer', 'alpr', 'webcam', 'wind', 'resource', 'fahrradparken'], trees: ['trees'], roofs: ['roofs'], netz: ['netz-region', 'netz-stadt', 'netz-stadt-tram'] });
+  });
+});
+
+describe('fahrradparken', () => {
+  it('node: typed fields, junk and missing values left out', () => {
+    const node = parseNode('n42 x8.681234 y50.11 Tamenity=bicycle_parking,bicycle_parking=stands,capacity=12,covered=yes,fee=maybe,capacity:cargo_bike=2');
+    expect(toFeature('fahrradparken', parkingRecord(node)).properties).toEqual({ type: 'stands', capacity: 12, covered: 'yes', cargo: 1, id: 42 });
+    const bare = parseNode('n7 x1 y2 Tamenity=bicycle_parking,capacity=ca.%20%10');
+    expect(toFeature('fahrradparken', parkingRecord(bare)).properties).toEqual({ id: 7 });
+  });
+
+  it('area: a point in the centre and the outline at zoom 14', () => {
+    const ring = [[8, 50], [8.002, 50], [8.002, 50.001], [8, 50.001], [8, 50]];
+    const [point, outline] = parkingArea({ properties: { '@type': 'way', '@id': 5, amenity: 'bicycle_parking', covered: 'no' }, geometry: { type: 'Polygon', coordinates: [ring] } })!;
+    expect(point).toEqual({ type: 'Feature', geometry: { type: 'Point', coordinates: [8.001, 50.0005] }, properties: { covered: 'no', osm: 'w', id: 5 } });
+    expect(outline).toMatchObject({ tippecanoe: { layer: 'fahrradparken_flaechen', minzoom: 14 }, geometry: { type: 'Polygon', coordinates: [ring] }, properties: point.properties });
+  });
+
+  it('keeps only bicycle parkings (osmium also exports what a relation refers to)', () => {
+    expect(parkingArea({ properties: { building: 'yes' }, geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] } })).toBeNull();
+  });
+
+  it('centre of a degenerate ring is the mean of its corners', () => {
+    expect(ringCentre([[1, 1], [2, 2], [3, 3], [1, 1]])).toEqual([2, 2]);
   });
 });
 
