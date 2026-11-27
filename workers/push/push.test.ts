@@ -403,3 +403,21 @@ describe('cron and routes (D1 on node:sqlite, stubbed KV, push service and Trans
     expect(await vapidAuth(env, EP, NOW + 12 * 3600000)).not.toBe(a);
   });
 });
+
+describe('single trips (with a date)', () => {
+  // Thursday 2026-10-29, 07:12 CET = 06:12Z
+  const once = trip({ date: '2026-10-29', days: [4], leads: [30] });
+  it('fires on its day only, not a week later', () => {
+    expect(dueNotifications(once, TZ, Date.parse('2026-10-29T05:42:00Z'), {})).toHaveLength(1);
+    expect(dueNotifications(once, TZ, Date.parse('2026-11-05T05:42:00Z'), {})).toEqual([]);
+  });
+  it('is found weeks ahead and ends after its day', () => {
+    expect(nextNotifyAt(once, TZ, Date.parse('2026-10-01T00:00:00Z'))).toBe(Date.parse('2026-10-29T05:42:00Z'));
+    expect(nextNotifyAt(once, TZ, Date.parse('2026-10-29T07:00:00Z'))).toBeNull();
+  });
+  it('keeps a valid date and drops a trip with a broken one', () => {
+    expect(cleanTrips([once])[0].date).toBe('2026-10-29');
+    expect(cleanTrips([{ ...once, date: 'morgen' }])).toEqual([]);
+    expect(cleanTrips([trip()])[0]).not.toHaveProperty('date');
+  });
+});

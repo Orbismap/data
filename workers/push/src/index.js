@@ -143,6 +143,10 @@ const clock = (ts, tz) => new Intl.DateTimeFormat('de-DE', { timeZone: tz, hour:
 
 // ---- which notifications are due ----------------------------------------------
 
+/** whether `trip` runs on `day` (a `zoned` result): a single trip on its date only, else on its weekdays */
+const isoOf = (day) => `${day.y}-${String(day.m).padStart(2, '0')}-${String(day.d).padStart(2, '0')}`;
+const runsOn = (trip, day) => (trip.date ? isoOf(day) === trip.date : trip.days.includes(day.wd));
+
 /**
  * Notifications of `trip` that are due at `now`: for each lead time, the departure today (or just after
  * midnight tomorrow) whose window [dep − lead, dep − lead + grace] contains now and that was not sent yet.
@@ -154,7 +158,7 @@ export function dueNotifications(trip, tz, now, sent) {
   for (const off of [0, 1]) {
     const dep = instantAt(t.y, t.m, t.d + off, h, mi, tz);
     const day = zoned(dep, tz);
-    if (!trip.days.includes(day.wd)) continue;
+    if (!runsOn(trip, day)) continue;
     for (const lead of trip.leads) {
       const from = dep - lead * 60000;
       const key = `${trip.id}|${day.y}-${day.m}-${day.d}|${lead}`;
@@ -373,7 +377,10 @@ export function cleanTrips(list) {
     const leads = Array.isArray(t.leads) ? [...new Set(t.leads.filter((n) => Number.isInteger(n) && n >= 1 && n <= 120))].slice(0, 5) : [];
     // the zone the time was saved in (the device may be somewhere else when it syncs later)
     const tz = validTz(t.tz) ? t.tz : undefined;
-    if (from && to && id && line && hmTxt && days.length && leads.length) out.push({ id, from, to, line, hm: hmTxt, days, leads, onlyDelay: !!t.onlyDelay, ...(tz ? { tz } : {}) });
+    // a single trip names its day; a broken date must not turn it into a weekly one
+    const date = typeof t.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.date) ? t.date : undefined;
+    if (t.date !== undefined && !date) continue;
+    if (from && to && id && line && hmTxt && days.length && leads.length) out.push({ id, from, to, line, hm: hmTxt, days, leads, onlyDelay: !!t.onlyDelay, ...(tz ? { tz } : {}), ...(date ? { date } : {}) });
   }
   return out;
 }
@@ -395,9 +402,11 @@ export function nextNotifyAt(trip, tz, now) {
   const [h, mi] = trip.hm.split(':').map(Number);
   const t = zoned(now, tz);
   let best = null;
-  for (let off = 0; off <= 8; off++) {
-    const dep = instantAt(t.y, t.m, t.d + off, h, mi, tz);
-    if (!trip.days.includes(zoned(dep, tz).wd)) continue;
+  // a single trip may lie weeks ahead: look at its date, not at the coming days
+  const [y, m, d] = trip.date ? trip.date.split('-').map(Number) : [t.y, t.m, t.d];
+  for (let off = 0; off <= (trip.date ? 0 : 8); off++) {
+    const dep = instantAt(y, m, d + off, h, mi, tz);
+    if (!runsOn(trip, zoned(dep, tz))) continue;
     for (const lead of trip.leads) {
       const from = dep - lead * 60000;
       if (now < Math.min(from + GRACE_MS, dep) && (best === null || from < best)) best = from;
