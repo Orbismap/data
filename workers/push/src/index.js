@@ -16,15 +16,21 @@
 // Real-time delays: the official DB "Timetables" API (DB API Marketplace, free key, XML) is queried here, so the
 // key stays in the worker and serves all users. Needs secrets DB_CLIENT_ID and DB_API_KEY. Without them the
 // delay endpoint answers 501 and the push check falls back to Transitous. Data: Deutsche Bahn AG, CC BY 4.0.
+// The elevators need the same application in the marketplace to also subscribe "StaDa - Station Data" and
+// "FaSta - Station Facilities Status" (both free).
 //
 // Routes:  GET /key          → { key }  public VAPID key (applicationServerKey)
 //          POST /db/delays   → real-time delay / platform / cancellation of rail departures and arrivals
+//          POST /db/lifts    → elevators out of service at stations (FaSta, station number from StaDa)
 //          GET  /db/check    → why one train is (not) found: ?von=<station>&zeit=HH:MM[&zug=RJ 384][&an=1][&tag=YYYY-MM-DD]
+//                                or ?von=<station>&aufzuege=1 for the elevator lookup
 //          POST /sync        → store the subscription with its trips
 //          POST /unsubscribe → forget a subscription
 //          POST /test        → send a test notification to one subscription
 
 const DB_BASE = 'https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1';
+const STADA_BASE = 'https://apis.deutschebahn.com/db-api-marketplace/apis/station-data/v2';
+const FASTA_BASE = 'https://apis.deutschebahn.com/db-api-marketplace/apis/fasta/v2';
 const MOTIS = 'https://api.transitous.org/api';
 const GRACE_MS = 4 * 60000; // a missed cron minute is made up for within this window
 const MAX_SUBS = 500;
@@ -465,6 +471,50 @@ export async function dbCheck(env, q, budget = newBudget()) {
   return { ...out, bahnhof: { name: station.name, eva: station.eva, meta: station.meta }, ergebnis, nummern, ...(notes.length ? { fehler: notes } : {}) };
 }
 
+// ---- elevators (StaDa and FaSta) ---------------------------------------------------------
+
+/** JSON from another API of the marketplace; null for "nothing there" (404) */
+async function marketJson(env, url, budget) {
+  spend(budget);
+  const res = await fetch(url, { headers: { 'DB-Client-Id': env.DB_CLIENT_ID, 'DB-Api-Key': env.DB_API_KEY, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`${new URL(url).pathname.includes('fasta') ? 'FaSta' : 'StaDa'} ${res.status}`);
+  return res.json();
+}
+
+/** FaSta knows stations by their station number, which StaDa gives for an EVA number */
+const stationNumber = (env, eva, budget) =>
+  cached(`stada|${eva}`, 7 * 86400000, async () => {
+    const r = await marketJson(env, `${env.DB_STADA_BASE || STADA_BASE}/stations?eva=${eva}`, budget);
+    return r?.result?.[0]?.number ?? null;
+  });
+
+/** the elevators of a station by state: { total, broken: [{ text, reason? }], unknown: [{ text }] } */
+export function readElevators(facilities) {
+  const lifts = (facilities ?? []).filter((f) => f.type === 'ELEVATOR');
+  const entry = (f) => ({ text: String(f.description || `Aufzug ${f.equipmentnumber}`), ...(f.stateExplanation && f.stateExplanation !== 'available' ? { reason: String(f.stateExplanation) } : {}) });
+  return { total: lifts.length, broken: lifts.filter((f) => f.state === 'INACTIVE').map(entry), unknown: lifts.filter((f) => f.state === 'UNKNOWN').map((f) => ({ text: entry(f).text })) };
+}
+
+async function liftsAt(env, name, budget, notes) {
+  try {
+    const station = await stationOf(env, name, budget, notes);
+    if (!station) return null;
+    const number = await stationNumber(env, station.eva, budget);
+    if (number == null) return null;
+    return await cached(`fasta|${number}`, 5 * 60000, async () => {
+      const r = await marketJson(env, `${env.DB_FASTA_BASE || FASTA_BASE}/stations/${number}`, budget);
+      return r ? readElevators(r.facilities) : null;
+    });
+  } catch (e) {
+    notes?.push(e.message);
+    return null;
+  }
+}
+
+/** aligned with `names`: the elevators of each station as they are now, or null when that is not known */
+export const dbLifts = (env, names, budget = newBudget()) => Promise.all(names.map((n) => liftsAt(env, n, budget)));
+
 // ---- message ---------------------------------------------------------------------
 
 /** the notification for a status, or null when nothing should be sent (trip is on time and only delays are wanted) */
@@ -662,6 +712,22 @@ async function delaysRoute(req, env) {
   return { results: await dbDelays(env, queries) };
 }
 
+async function liftsRoute(req, env) {
+  if (!env.DB_CLIENT_ID || !env.DB_API_KEY) return 501;
+  if (limited(`lifts|${req.headers.get('CF-Connecting-IP') || ''}`, 20, 60000)) return 429;
+  const raw = await req.text();
+  if (raw.length > 5000) return 413;
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return 400;
+  }
+  const names = (Array.isArray(body?.stations) ? body.stations : []).slice(0, 8);
+  if (!names.length || !names.every((n) => typeof n === 'string' && n.length > 0 && n.length <= 100)) return 400;
+  return { results: await dbLifts(env, names) };
+}
+
 /** `GET /db/check` – to open in a browser (no Origin header there): public timetable data only, tightly limited */
 async function checkRoute(req, env, url) {
   if (!env.DB_CLIENT_ID || !env.DB_API_KEY) return 501;
@@ -669,9 +735,15 @@ async function checkRoute(req, env, url) {
   const station = p.get('von') ?? '';
   const time = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(p.get('zeit') ?? '');
   const day = p.get('tag') ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(p.get('tag')) : null;
-  if (!station || station.length > 100 || !time || (p.get('tag') && !day)) return 400;
+  const lifts = !!p.get('aufzuege');
+  if (!station || station.length > 100 || (!lifts && !time) || (p.get('tag') && !day)) return 400;
   // per address and for everybody together: the key's ~60 calls a minute belong to the app first
   if (limited(`check|${req.headers.get('CF-Connecting-IP') || ''}`, 6, 60000) || limited('check|all', 12, 60000)) return 429;
+  if (lifts) {
+    const notes = [];
+    const found = await liftsAt(env, station, newBudget(10), notes);
+    return { bahnhof: station, ergebnis: found ?? 'unbekannt', ...(notes.length ? { fehler: notes } : {}) };
+  }
   const today = zoned(Date.now(), 'Europe/Berlin');
   const [y, m, d] = day ? day.slice(1).map(Number) : [today.y, today.m, today.d];
   const ts = instantAt(y, m, d, +time[1], +time[2], 'Europe/Berlin');
@@ -683,6 +755,7 @@ async function handle(req, env, url) {
   if (url.pathname === '/key' && req.method === 'GET') return { key: env.VAPID_PUBLIC };
   if (req.method !== 'POST') return 404;
   if (url.pathname === '/db/delays') return delaysRoute(req, env);
+  if (url.pathname === '/db/lifts') return liftsRoute(req, env);
   const raw = await req.text();
   if (raw.length > 30000) return 413;
   let body;
