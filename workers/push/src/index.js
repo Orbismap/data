@@ -492,7 +492,7 @@ const stationNumber = (env, eva, budget) =>
 /** the elevators of a station by state: { total, broken: [{ text, reason? }], unknown: [{ text }] } */
 export function readElevators(facilities) {
   const lifts = (facilities ?? []).filter((f) => f.type === 'ELEVATOR');
-  const entry = (f) => ({ text: String(f.description || `Aufzug ${f.equipmentnumber}`), ...(f.stateExplanation && f.stateExplanation !== 'available' ? { reason: String(f.stateExplanation) } : {}) });
+  const entry = (f) => ({ text: String(f.description || `Aufzug ${f.equipmentnumber}`), ...(f.stateExplanation && !['available', 'not available'].includes(f.stateExplanation) ? { reason: String(f.stateExplanation) } : {}) });
   return { total: lifts.length, broken: lifts.filter((f) => f.state === 'INACTIVE').map(entry), unknown: lifts.filter((f) => f.state === 'UNKNOWN').map((f) => ({ text: entry(f).text })) };
 }
 
