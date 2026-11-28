@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeD1 } from '../d1-fake';
 // @ts-expect-error – plain JS worker file, deployed on its own
-import worker, { buildMessage, cleanTrips, dbCheck, dbDelays, dbName, evasOf, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, runDue, subId, vapidAuth, zoned } from './src/index.js';
+import worker, { buildMessage, cleanTrips, dbCheck, dbDelays, dbName, evasOf, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, readMessages, runDue, subId, vapidAuth, zoned } from './src/index.js';
 
 const TZ = 'Europe/Berlin';
 const stop = (name: string) => ({ id: `id-${name}`, name, lat: 53.7, lon: 11.4, src: 'db' });
@@ -204,6 +204,32 @@ describe('stations with several names and numbers', () => {
     expect(((await ok.json()) as { ergebnis: string }).ergebnis).toBe('gefunden');
     expect((await worker.fetch(new Request('https://w/db/check?von=Berlin'), open)).status).toBe(400);
     expect((await worker.fetch(new Request('https://w/key'), open)).status).toBe(403);
+  });
+});
+
+describe('messages of a stop', () => {
+  const m = (t: string, c: number, ts: string) => ({ t, c: String(c), ts });
+
+  it('gives the latest delay reason and the notes about the train', () => {
+    const r = readMessages([m('d', 43, '2611280900'), m('q', 91, '2611280910'), m('d', 36, '2611280930'), m('f', 97, '2611280920'), m('h', 31, '2611280940'), m('q', 900, '2611280950')]);
+    expect(r.cause).toBe('Technische Störung am Zug');
+    expect(r.notes).toEqual([{ code: 97, text: 'Hohe Auslastung' }, { code: 91, text: 'Fahrradmitnahme nicht möglich' }]);
+  });
+
+  it('drops notes that were taken back, whatever the order in the file', () => {
+    const r = readMessages([m('q', 88, '2611281000'), m('q', 91, '2611280900'), m('q', 80, '2611280905'), m('q', 90, '2611281010')]);
+    expect(r.notes.map((n) => n.code)).toEqual([90, 80]);
+    expect(readMessages([m('q', 80, '1'), m('q', 84, '2')]).notes).toEqual([]);
+  });
+
+  it('reads them from the changes; a reason only comes with a delay or cancellation', () => {
+    const plan = parseTimetable('<timetable><s id="a"><tl c="ICE" n="1"/><dp pt="2611281034"/></s></timetable>');
+    const changes = (ct: string) => parseTimetable(`<timetable><s id="a"><m id="r1" t="q" c="91" ts="2611280900"/><dp ct="${ct}"><m id="r2" t="d" c="34" ts="2611280901"/></dp></s></timetable>`);
+    const q = { ts: Date.parse('2026-11-28T09:34:00Z'), kind: 'dep', line: 'ICE 1' };
+    expect(matchDelay(plan, changes('2611281040'), q)).toMatchObject({ delayMin: 6, cause: 'Defekt an einem Signal', notes: [{ code: 91 }] });
+    const onTime = matchDelay(plan, changes('2611281034'), q)!;
+    expect(onTime).not.toHaveProperty('cause');
+    expect(onTime.notes).toHaveLength(1);
   });
 });
 
