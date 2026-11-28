@@ -205,6 +205,59 @@ export async function liveStatus(trip, dep, env, budget = newBudget()) {
   return null;
 }
 
+// ---- messages of a stop --------------------------------------------------------
+
+// What the numbers in <m t="…" c="…"/> mean, and which later note takes back an earlier one. Taken from the open
+// source module Travel-Status-DE-IRIS by Birte Friesel (derf), wording shortened. DB does not send the texts.
+const MESSAGES = {
+  2: 'Polizeieinsatz', 3: 'Feuerwehreinsatz auf der Strecke', 4: 'Kurzfristiger Personalausfall', 5: 'Ärztliche Versorgung eines Fahrgasts',
+  6: 'Notbremse wurde gezogen', 7: 'Unbefugte Personen auf der Strecke', 8: 'Notarzteinsatz auf der Strecke', 9: 'Streikauswirkungen',
+  10: 'Tiere auf der Strecke', 11: 'Unwetter', 12: 'Warten auf ein verspätetes Schiff', 13: 'Pass- und Zollkontrolle', 14: 'Defekt am Bahnhof',
+  15: 'Vandalismus', 16: 'Entschärfung einer Fliegerbombe', 17: 'Beschädigte Brücke', 18: 'Umgestürzter Baum auf der Strecke',
+  19: 'Unfall an einem Bahnübergang', 20: 'Tiere im Gleis', 21: 'Warten auf Anschlussreisende', 22: 'Witterung', 23: 'Betriebsstabilisierung',
+  24: 'Verspätung im Ausland', 25: 'Bereitstellung weiterer Wagen', 26: 'Abhängen von Wagen', 27: 'Technische Störung am Bus',
+  28: 'Gegenstände auf der Strecke', 29: 'Ersatzverkehr mit Bus ist eingerichtet', 30: 'Personalausfall im Stellwerk', 31: 'Bauarbeiten',
+  32: 'Längerer Halt am Bahnhof', 33: 'Defekt an der Oberleitung', 34: 'Defekt an einem Signal', 35: 'Streckensperrung',
+  36: 'Technische Störung am Zug', 37: 'Kurzfristiger Fahrzeugausfall', 38: 'Defekt an der Strecke', 39: 'Hohes Verkehrsaufkommen',
+  40: 'Defektes Stellwerk', 41: 'Defekt an einem Bahnübergang', 42: 'Außerplanmäßige Geschwindigkeitsbeschränkung',
+  43: 'Verspätung eines vorausfahrenden Zuges', 44: 'Warten auf einen entgegenkommenden Zug', 45: 'Vorfahrt eines anderen Zuges',
+  46: 'Vorfahrt eines anderen Zuges', 47: 'Verspätete Bereitstellung', 48: 'Verspätung aus vorheriger Fahrt', 49: 'Kurzfristiger Personalausfall',
+  50: 'Kurzfristige Erkrankung von Personal', 51: 'Verspätetes Personal aus vorheriger Fahrt', 52: 'Streik', 53: 'Unwetterfolgen',
+  54: 'Gleise nur eingeschränkt verfügbar', 55: 'Technischer Defekt an einem anderen Zug', 56: 'Laden der Antriebsbatterie', 57: 'Zusätzlicher Halt',
+  58: 'Umleitung', 59: 'Schnee und Eis', 60: 'Wegen Witterung verminderte Geschwindigkeit', 61: 'Defekte Tür', 62: 'Behobener Defekt am Zug',
+  63: 'Technische Untersuchung am Zug', 64: 'Defekt an einer Weiche', 65: 'Erdrutsch', 66: 'Hochwasser', 67: 'Behördliche Maßnahme',
+  68: 'Hohes Fahrgastaufkommen', 69: 'Zug fährt langsamer', 70: 'WLAN nicht verfügbar', 71: 'WLAN eingeschränkt',
+  72: 'Info/Entertainment nicht verfügbar', 73: 'Heute: Mehrzweckabteil vorne', 74: 'Heute: Mehrzweckabteil hinten', 75: 'Heute: 1. Klasse vorne',
+  76: 'Heute: 1. Klasse hinten', 77: '1. Klasse fehlt', 78: 'Ersatzverkehr mit Bus ist eingerichtet', 79: 'Mehrzweckabteil fehlt',
+  80: 'Abweichende Wagenreihung', 81: 'Fahrzeugtausch', 82: 'Mehrere Wagen fehlen', 83: 'Heute ohne fahrzeuggebundene Einstiegshilfe',
+  85: 'Ein Wagen fehlt', 86: 'Gesamter Zug ohne Reservierung', 87: 'Einzelne Wagen ohne Reservierung', 90: 'Kein gastronomisches Angebot',
+  91: 'Fahrradmitnahme nicht möglich', 92: 'Fahrradmitnahme kann nicht garantiert werden', 93: 'Behindertengerechte Einrichtung fehlt',
+  94: 'Ersatzbewirtschaftung', 95: 'Universaltoilette fehlt', 96: 'Zustieg kann nicht garantiert werden', 97: 'Hohe Auslastung',
+  98: 'Sonstige Qualitätsmängel', 99: 'Verzögerungen im Betriebsablauf',
+};
+// 84 "wagons in the right order", 88 "no shortcomings", 89 "reservations work again" only take others back
+const TAKES_BACK = { 73: [74], 74: [73], 75: [76], 76: [75], 84: [73, 74, 75, 76, 80], 88: [70, 71, 72, 77, 78, 79, 82, 83, 85, 90, 91, 92, 93, 94, 95, 96, 97, 98], 89: [86, 87] };
+
+/**
+ * The messages of a stop (arrival, departure and the stop itself): the latest reason for a delay (type d) and the
+ * notes still valid about the train (types q and f: wagons, bikes, load, food …). Unknown codes are left out.
+ */
+export function readMessages(list) {
+  let cause;
+  const notes = new Map();
+  for (const m of [...list].sort((a, b) => String(a.ts).localeCompare(String(b.ts)))) {
+    const code = Number(m.c);
+    if (m.t === 'd') {
+      if (MESSAGES[code]) cause = MESSAGES[code];
+    } else if (m.t === 'q' || m.t === 'f') {
+      for (const old of TAKES_BACK[code] ?? []) notes.delete(old);
+      notes.delete(code); // said again: it moves to the end, as the newest
+      if (MESSAGES[code]) notes.set(code, MESSAGES[code]);
+    }
+  }
+  return { cause, notes: [...notes].reverse().map(([code, text]) => ({ code, text })) };
+}
+
 // ---- official DB Timetables API (XML) ---------------------------------------------------
 
 const decodeXml = (v) => v.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
@@ -223,12 +276,13 @@ export function parseStations(xml) {
   return [...xml.matchAll(/<station\s([^>]*?)\/?>/g)].map((m) => attrsOf(m[1])).filter((a) => a.eva && a.name);
 }
 
-/** stops of a timetable (planned: pt/pp, changes: ct/cp/cs): [{ id, tl, ar, dp }] */
+/** stops of a timetable (planned: pt/pp, changes: ct/cp/cs, messages): [{ id, tl, ar, dp, ms }] */
 export function parseTimetable(xml) {
   const out = [];
   for (const m of xml.matchAll(/<s\s([^>]*?)(?:\/>|>([\s\S]*?)<\/s>)/g)) {
     const body = m[2] ?? '';
-    out.push({ id: attrsOf(m[1]).id, tl: tagOf(body, 'tl'), ar: tagOf(body, 'ar'), dp: tagOf(body, 'dp') });
+    const ms = [...body.matchAll(/<m\s([^>]*?)\/?>/g)].map((x) => attrsOf(x[1]));
+    out.push({ id: attrsOf(m[1]).id, tl: tagOf(body, 'tl'), ar: tagOf(body, 'ar'), dp: tagOf(body, 'dp'), ms });
   }
   return out;
 }
@@ -274,14 +328,24 @@ export function matchDelay(planned, changes, q) {
   const wanted = named ? normLine(named[1] || named[2]) : normLine(q.line);
   const hit = exact.length === 1 ? exact[0] : exact.length === 0 && cands.length === 1 && !wanted ? cands[0] : null;
   if (!hit) return null;
-  const ch = changes.find((c) => c.id === hit.id)?.[key];
+  const changed = changes.find((c) => c.id === hit.id);
+  const ch = changed?.[key];
   const cancelled = ch?.cs === 'c' || hit[key]?.cs === 'c';
   // no entry in the changes: on time if it is soon, otherwise the real time just is not known yet
   const unknown = !ch?.ct && q.ts - (q.now ?? Date.now()) > KNOWN_AHEAD_MS;
   const delayMin = ch?.ct ? Math.round((stampMs(ch.ct) - stampMs(stamp)) / 60000) : unknown ? null : 0;
   const plannedTrack = hit[key]?.pp;
   // DB: cp = changed platform, pp = planned platform
-  return { delayMin, cancelled, track: ch?.cp ?? plannedTrack, trackChanged: !!ch?.cp && !!plannedTrack && ch.cp !== plannedTrack };
+  const { cause, notes } = readMessages(changed?.ms ?? []);
+  return {
+    delayMin,
+    cancelled,
+    track: ch?.cp ?? plannedTrack,
+    trackChanged: !!ch?.cp && !!plannedTrack && ch.cp !== plannedTrack,
+    // old reasons stay in the data: one is only given while there is something to explain
+    ...(cause && (cancelled || delayMin >= 2) ? { cause } : {}),
+    ...(notes.length ? { notes } : {}),
+  };
 }
 
 // small caches per worker instance: the free key allows 60 calls a minute for all users together
