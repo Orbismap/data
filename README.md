@@ -44,7 +44,7 @@ Der `name` in jeder `wrangler.jsonc` entspricht dem bereits deployten Worker, da
 | Ordner | Worker-Name | URL | Bindings / Trigger | Dashboard-Variablen |
 |---|---|---|---|---|
 | `workers/proxy` | `orbis` | `https://orbis.malte9799.workers.dev/` | - | `ALLOWED_ORIGINS`, optional `AISSTREAM_KEY` |
-| `workers/push` | `orbis-trains` | `https://orbis-trains.malte9799.workers.dev/` | D1 `DB` (`orbis-push`), Cron `* * * * *` | `DB_CLIENT_ID`, `DB_API_KEY`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, `VAPID_SUBJECT`, optional `ALLOWED_ORIGINS`, `DB_TIMETABLES_BASE` |
+| `workers/push` | `orbis-trains` | `https://orbis-trains.malte9799.workers.dev/` | D1 `DB` (`orbis-push`), Cron `* * * * *` | `DB_CLIENT_ID`, `DB_API_KEY`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, `VAPID_SUBJECT`, optional `ALLOWED_ORIGINS`, `DB_TIMETABLES_BASE`, `DB_STADA_BASE`, `DB_FASTA_BASE`. Im DB API Marketplace braucht die Anwendung Timetables, StaDa und FaSta |
 | `workers/camdir` | `orbis-cams` | `https://orbis-cams.malte9799.workers.dev/` | D1 `DB` (`orbis-camdir`) | `ADMIN_TOKEN`, optional `ALLOWED_ORIGINS` |
 | `workers/clock` | `orbis-clock` | keine (`workers_dev: false`, `fetch` antwortet 404) | R2 `LIVE` (`orbis-live`), Cron `* * * * *` | Secret `GH_DISPATCH_TOKEN` (startet die GitHub-Actions-Sammler, siehe [Sammler](#sammler-collectors-und-github-actions)); ohne Secret loggt die Uhr das einmal und spiegelt weiter |
 

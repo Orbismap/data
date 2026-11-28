@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeD1 } from '../d1-fake';
 // @ts-expect-error – plain JS worker file, deployed on its own
-import worker, { buildMessage, cleanTrips, dbCheck, dbDelays, dbName, evasOf, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, readMessages, runDue, subId, vapidAuth, zoned } from './src/index.js';
+import worker, { buildMessage, cleanTrips, dbCheck, dbDelays, dbLifts, dbName, evasOf, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, readElevators, readMessages, runDue, subId, vapidAuth, zoned } from './src/index.js';
 
 const TZ = 'Europe/Berlin';
 const stop = (name: string) => ({ id: `id-${name}`, name, lat: 53.7, lon: 11.4, src: 'db' });
@@ -230,6 +230,43 @@ describe('messages of a stop', () => {
     const onTime = matchDelay(plan, changes('2611281034'), q)!;
     expect(onTime).not.toHaveProperty('cause');
     expect(onTime.notes).toHaveLength(1);
+  });
+});
+
+describe('elevators', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const FACILITIES = [
+    { equipmentnumber: 1, type: 'ELEVATOR', description: 'zu Gleis 1/2', state: 'INACTIVE', stateExplanation: 'Reparatur' },
+    { equipmentnumber: 2, type: 'ELEVATOR', description: 'zu Gleis 5/6', state: 'ACTIVE', stateExplanation: 'available' },
+    { equipmentnumber: 3, type: 'ELEVATOR', state: 'UNKNOWN' },
+    { equipmentnumber: 4, type: 'ESCALATOR', state: 'INACTIVE' },
+  ];
+  const env = { DB_CLIENT_ID: 'c', DB_API_KEY: 'k' };
+
+  it('keeps elevators only and says which are out of service', () => {
+    expect(readElevators(FACILITIES)).toEqual({ total: 3, broken: [{ text: 'zu Gleis 1/2', reason: 'Reparatur' }], unknown: [{ text: 'Aufzug 3' }] });
+  });
+
+  it('goes from the name over the station number to the elevators, aligned', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url);
+      if (url.includes('/station/')) return new Response(decodeURIComponent(url).endsWith('/station/Liftstadt Hbf') ? '<stations><station name="Liftstadt Hbf" eva="8099001"/></stations>' : '<stations/>');
+      if (url.includes('/station-data/')) return Response.json({ result: [{ number: 4711 }] });
+      return Response.json({ stationnumber: 4711, facilities: FACILITIES });
+    }));
+    const r = await dbLifts(env, ['Liftstadt Hauptbahnhof', 'Nirgendheim']);
+    expect(r[0]?.broken).toHaveLength(1);
+    expect(r[1]).toBeNull();
+    expect(urls.some((u) => u.endsWith('/station-data/v2/stations?eva=8099001'))).toBe(true);
+    expect(urls.some((u) => u.endsWith('/fasta/v2/stations/4711'))).toBe(true);
+  });
+
+  it('answers unknown without a subscription, and the browser check says why', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.includes('/station/') ? new Response('<stations><station name="Sperrstadt" eva="8099002"/></stations>') : new Response('no', { status: 403 }))));
+    expect(await dbLifts(env, ['Sperrstadt'])).toEqual([null]);
+    const res = await worker.fetch(new Request('https://w/db/check?von=Sperrstadt&aufzuege=1'), env);
+    expect(await res.json()).toMatchObject({ ergebnis: 'unbekannt', fehler: ['StaDa 403'] });
   });
 });
 
