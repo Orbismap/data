@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeD1 } from '../d1-fake';
 // @ts-expect-error – plain JS worker file, deployed on its own
-import worker, { buildMessage, cleanTrips, dbDelays, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, runDue, subId, vapidAuth, zoned } from './src/index.js';
+import worker, { buildMessage, cleanTrips, dbCheck, dbDelays, dbName, evasOf, dbStamp, dueNotifications, instantAt, limited, matchDelay, nextNotifyAt, parseStations, parseTimetable, pickStation, pushEndpoint, runDue, subId, vapidAuth, zoned } from './src/index.js';
 
 const TZ = 'Europe/Berlin';
 const stop = (name: string) => ({ id: `id-${name}`, name, lat: 53.7, lon: 11.4, src: 'db' });
@@ -153,6 +153,57 @@ describe('dbDelays (stubbed API)', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('no', { status: 503 })));
     const r = await dbDelays({ DB_CLIENT_ID: 'c', DB_API_KEY: 'k' }, [{ station: 'Nirgendwo 1', ts: Date.now(), kind: 'dep', line: 'RE1' }]);
     expect(r).toEqual([null]);
+  });
+});
+
+describe('stations with several names and numbers', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const STATIONS = '<stations><station name="Berlin Hbf" eva="8011160" meta="8089021|8098160"/></stations>';
+  const LOW = '<timetable><s id="rj"><tl c="RJ" n="384"/><dp pt="2611281034" pp="6"/></s></timetable>';
+  const LOW_CHANGES = '<timetable><s id="rj"><dp ct="2611281037"/></s></timetable>';
+  const stub = (urls: string[]) =>
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(decodeURIComponent(url));
+      if (url.includes('/station/')) return new Response(decodeURIComponent(url).endsWith('/station/Berlin Hbf') ? STATIONS : '<stations/>');
+      if (url.includes('/plan/8089021/')) return new Response('no', { status: 404 });
+      return new Response(url.includes('/plan/8098160/') ? LOW : url.includes('/fchg/8098160') ? LOW_CHANGES : '<timetable/>');
+    }));
+  const q = { station: 'S+U Berlin Hauptbahnhof', ts: Date.parse('2026-11-28T09:34:00Z'), kind: 'dep', line: 'RJ 384' };
+  const env = { DB_CLIENT_ID: 'c', DB_API_KEY: 'k' };
+
+  it('writes feed names the way the DB does', () => {
+    expect(dbName('S+U Berlin Hauptbahnhof')).toBe('Berlin Hbf');
+    expect(dbName('Stuttgart Hbf')).toBe('Stuttgart Hbf');
+    expect(dbName('Ulm Hauptbahnhof')).toBe('Ulm Hbf');
+    expect(pickStation('S+U Berlin Hauptbahnhof', [{ name: 'Berlin Hbf', eva: '1' }])?.eva).toBe('1');
+  });
+  it('knows the low level of Berlin Hbf also without meta', () => {
+    expect(evasOf({ eva: '8011160' })).toEqual(['8011160', '8098160']);
+    expect(evasOf({ eva: '8010046', meta: 'Nord|8010047' })).toEqual(['8010046', '8010047']);
+  });
+  it('finds a train that is listed under another number of the station', async () => {
+    const urls: string[] = [];
+    stub(urls);
+    const [r] = await dbDelays(env, [q]);
+    expect(r).toMatchObject({ delayMin: 3, track: '6' });
+    expect(urls.some((u) => u.includes('/fchg/8011160'))).toBe(false);
+  });
+  it('says which numbers were asked and what is planned there', async () => {
+    stub([]);
+    const found = await dbCheck(env, q);
+    expect(found.ergebnis).toBe('gefunden');
+    const missed = await dbCheck(env, { ...q, line: 'ICE 1' });
+    expect(missed.ergebnis).toBe('Zugname passt zu keinem Zug dieser Minute');
+    expect(missed.nummern?.find((n) => n.eva === '8098160')?.zurPlanzeit).toEqual([{ gattung: 'RJ', nummer: '384', linie: undefined }]);
+  });
+  it('opens in a browser without Origin, the other routes stay closed', async () => {
+    stub([]);
+    const open = { ...env, ALLOWED_ORIGINS: 'https://bahn.example' };
+    const ok = await worker.fetch(new Request('https://w/db/check?von=Berlin%20Hbf&zeit=10:34&zug=RJ%20384&tag=2026-11-28'), open);
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { ergebnis: string }).ergebnis).toBe('gefunden');
+    expect((await worker.fetch(new Request('https://w/db/check?von=Berlin'), open)).status).toBe(400);
+    expect((await worker.fetch(new Request('https://w/key'), open)).status).toBe(403);
   });
 });
 

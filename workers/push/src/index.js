@@ -19,6 +19,7 @@
 //
 // Routes:  GET /key          → { key }  public VAPID key (applicationServerKey)
 //          POST /db/delays   → real-time delay / platform / cancellation of rail departures and arrivals
+//          GET  /db/check    → why one train is (not) found: ?von=<station>&zeit=HH:MM[&zug=RJ 384][&an=1][&tag=YYYY-MM-DD]
 //          POST /sync        → store the subscription with its trips
 //          POST /unsubscribe → forget a subscription
 //          POST /test        → send a test notification to one subscription
@@ -232,8 +233,11 @@ export function parseTimetable(xml) {
   return out;
 }
 
-const normName = (n) => n.toLowerCase().replace(/ß/g, 'ss').replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
-const stripStation = (n) => normName(n).replace(/\b(bahnhof|bf|hbf|hauptbahnhof|haltepunkt|hp)\b/g, ' ').replace(/\s+/g, ' ').trim();
+/** the name as the DB writes it: feeds say "S+U Berlin Hauptbahnhof" where the DB says "Berlin Hbf" */
+export const dbName = (n) => n.replace(/^\s*(S\s*\+\s*U|S|U)(\s+|-(?=\s))/i, '').replace(/\bHauptbahnhof\b/gi, 'Hbf').replace(/\s+Bhf\b/g, '').replace(/\s+/g, ' ').trim();
+
+const normName = (n) => dbName(n).toLowerCase().replace(/ß/g, 'ss').replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/\([^)]*\)/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+const stripStation = (n) => normName(n).replace(/\b(bahnhof|bf|hbf|hauptbahnhof|bhf|haltepunkt|hp)\b/g, ' ').replace(/\s+/g, ' ').trim();
 
 /** the station of `list` that is meant by `name` (exact, then without "Bahnhof"/"Hbf", then a prefix match) or null */
 export function pickStation(name, list) {
@@ -303,14 +307,52 @@ async function dbGet(env, path, budget) {
   return res.text();
 }
 
-async function evaOf(env, name, budget) {
-  const variants = [...new Set([name, name.replace(/\s*\(.*\)\s*$/, ''), name.replace(/,.*$/, ''), name.replace(/\s+(Bahnhof|Bf|Hbf)$/i, '')].map((v) => v.trim()).filter(Boolean))];
+// Stations with a second number for another part of the building. A train is listed under only one of them, e.g. the
+// north–south platforms of Berlin Hbf ("tief"). The station search may name more of them in its `meta` attribute.
+const SIBLINGS = { 8011160: ['8098160'] };
+
+/** all numbers under which trains of `station` may be listed, the station's own first */
+export function evasOf(station) {
+  const meta = String(station.meta ?? '').split('|').map((x) => x.trim()).filter((x) => /^80\d{5}$/.test(x));
+  return [...new Set([station.eva, ...(SIBLINGS[station.eva] ?? []), ...meta])].slice(0, 3);
+}
+
+/** the station meant by `name` as { name, eva, meta } or null; `notes` collects why the search failed */
+async function stationOf(env, name, budget, notes) {
+  const clean = dbName(name);
+  const variants = [...new Set([clean, name, clean.replace(/\s*\(.*\)\s*$/, ''), clean.replace(/,.*$/, ''), clean.replace(/\s+(Bahnhof|Bf|Hbf)$/i, '')].map((v) => v.trim()).filter(Boolean))];
   for (const v of variants) {
-    const eva = await cached(`eva|${normName(v)}`, 7 * 86400000, async () => {
+    const station = await cached(`station|${normName(name)}|${v}`, 7 * 86400000, async () => {
       const list = parseStations(await dbGet(env, `/station/${encodeURIComponent(v)}`, budget));
-      return pickStation(name, list)?.eva ?? '';
-    }).catch(() => '');
-    if (eva) return eva;
+      return pickStation(name, list);
+    }).catch((e) => {
+      notes?.push(e.message);
+      return null;
+    });
+    if (station) return station;
+  }
+  return null;
+}
+
+const planOf = (env, eva, stamp, budget) =>
+  cached(`plan|${eva}|${stamp.slice(0, 8)}`, 3600000, async () => parseTimetable(await dbGet(env, `/plan/${eva}/${stamp.slice(0, 6)}/${stamp.slice(6, 8)}`, budget)));
+const changesOf = (env, eva, budget) => cached(`fchg|${eva}`, 45000, async () => parseTimetable(await dbGet(env, `/fchg/${eva}`, budget)));
+
+/**
+ * One query at the numbers of its station, one after the other until the train is found (further numbers cost calls
+ * only for trains the first one does not know). A failing number does not stop the others.
+ */
+async function lookupAt(env, evas, q, budget, notes) {
+  const stamp = dbStamp(q.ts);
+  for (const eva of evas) {
+    try {
+      const planned = await planOf(env, eva, stamp, budget);
+      // changes are only needed (and only fetched) where the plan knows the train
+      if (!matchDelay(planned, [], q)) continue;
+      return matchDelay(planned, await changesOf(env, eva, budget), q);
+    } catch (e) {
+      notes?.push(`${eva}: ${e.message}`);
+    }
   }
   return null;
 }
@@ -321,25 +363,42 @@ async function evaOf(env, name, budget) {
  */
 export async function dbDelays(env, queries, budget = newBudget()) {
   const names = [...new Set(queries.map((x) => x.station))];
-  const found = await Promise.all(names.map((n) => evaOf(env, n, budget)));
-  const evas = new Map(names.map((n, i) => [n, found[i]]));
+  const found = await Promise.all(names.map((n) => stationOf(env, n, budget)));
+  const stations = new Map(names.map((n, i) => [n, found[i]]));
   // a query that runs out of subrequests answers null (unknown) like any other miss
   return Promise.all(
     queries.map(async (q) => {
-      const eva = evas.get(q.station);
-      if (!eva) return null;
-      const stamp = dbStamp(q.ts);
-      try {
-        const [planned, changes] = await Promise.all([
-          cached(`plan|${eva}|${stamp.slice(0, 8)}`, 3600000, async () => parseTimetable(await dbGet(env, `/plan/${eva}/${stamp.slice(0, 6)}/${stamp.slice(6, 8)}`, budget))),
-          cached(`fchg|${eva}`, 45000, async () => parseTimetable(await dbGet(env, `/fchg/${eva}`, budget))),
-        ]);
-        return matchDelay(planned, changes, q);
-      } catch {
-        return null;
-      }
+      const station = stations.get(q.station);
+      return station ? lookupAt(env, evasOf(station), q, budget) : null;
     }),
   );
+}
+
+/**
+ * Diagnosis of one query: which station was found, which numbers were asked, which trains the DB plans there in that
+ * minute and what matched. Says why a train is missing instead of only answering null.
+ */
+export async function dbCheck(env, q, budget = newBudget()) {
+  const notes = [];
+  const station = await stationOf(env, q.station, budget, notes);
+  const out = { frage: { bahnhof: q.station, gesuchtAls: dbName(q.station), zug: q.line, art: q.kind === 'arr' ? 'Ankunft' : 'Abfahrt', planzeit: dbStamp(q.ts) } };
+  if (!station) return { ...out, ergebnis: 'Bahnhof nicht gefunden', fehler: notes };
+  const key = q.kind === 'arr' ? 'ar' : 'dp';
+  const stamp = dbStamp(q.ts);
+  const nummern = [];
+  for (const eva of evasOf(station)) {
+    try {
+      const planned = await planOf(env, eva, stamp, budget);
+      const zuege = planned.filter((s) => s[key]?.pt === stamp).map((s) => ({ gattung: s.tl?.c, nummer: s.tl?.n, linie: s[key].l }));
+      const hit = matchDelay(planned, [], q) ? matchDelay(planned, await changesOf(env, eva, budget), q) : null;
+      nummern.push({ eva, haltImStundenplan: planned.length, zurPlanzeit: zuege, treffer: hit });
+    } catch (e) {
+      nummern.push({ eva, fehler: e.message });
+    }
+  }
+  const treffer = nummern.find((n) => n.treffer);
+  const ergebnis = treffer ? 'gefunden' : nummern.some((n) => n.zurPlanzeit?.length) ? 'Zugname passt zu keinem Zug dieser Minute' : 'kein Zug zu dieser Minute (oder Fehler, siehe nummern)';
+  return { ...out, bahnhof: { name: station.name, eva: station.eva, meta: station.meta }, ergebnis, nummern, ...(notes.length ? { fehler: notes } : {}) };
 }
 
 // ---- message ---------------------------------------------------------------------
@@ -539,6 +598,22 @@ async function delaysRoute(req, env) {
   return { results: await dbDelays(env, queries) };
 }
 
+/** `GET /db/check` – to open in a browser (no Origin header there): public timetable data only, tightly limited */
+async function checkRoute(req, env, url) {
+  if (!env.DB_CLIENT_ID || !env.DB_API_KEY) return 501;
+  const p = url.searchParams;
+  const station = p.get('von') ?? '';
+  const time = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(p.get('zeit') ?? '');
+  const day = p.get('tag') ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(p.get('tag')) : null;
+  if (!station || station.length > 100 || !time || (p.get('tag') && !day)) return 400;
+  // per address and for everybody together: the key's ~60 calls a minute belong to the app first
+  if (limited(`check|${req.headers.get('CF-Connecting-IP') || ''}`, 6, 60000) || limited('check|all', 12, 60000)) return 429;
+  const today = zoned(Date.now(), 'Europe/Berlin');
+  const [y, m, d] = day ? day.slice(1).map(Number) : [today.y, today.m, today.d];
+  const ts = instantAt(y, m, d, +time[1], +time[2], 'Europe/Berlin');
+  return dbCheck(env, { station, ts, kind: p.get('an') ? 'arr' : 'dep', line: (p.get('zug') ?? '').slice(0, 40) }, newBudget(15));
+}
+
 async function handle(req, env, url) {
   const ip = req.headers.get('CF-Connecting-IP') || '';
   if (url.pathname === '/key' && req.method === 'GET') return { key: env.VAPID_PUBLIC };
@@ -590,10 +665,16 @@ async function handle(req, env, url) {
 
 export default {
   async fetch(req, env) {
+    const url = new URL(req.url);
+    if (url.pathname === '/db/check' && req.method === 'GET') {
+      const out = await checkRoute(req, env, url).catch(() => 500);
+      if (typeof out === 'number') return new Response(String(out), { status: out });
+      return new Response(JSON.stringify(out, null, 2), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+    }
     const cors = corsFor(req, env);
     if (!cors) return new Response('Forbidden', { status: 403 });
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-    const out = await handle(req, env, new URL(req.url)).catch(() => 500);
+    const out = await handle(req, env, url).catch(() => 500);
     if (typeof out === 'number') return new Response(String(out), { status: out, headers: cors });
     return new Response(JSON.stringify(out), { headers: { ...cors, 'Content-Type': 'application/json' } });
   },
