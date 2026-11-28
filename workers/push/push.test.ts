@@ -247,6 +247,11 @@ describe('elevators', () => {
     expect(readElevators(FACILITIES)).toEqual({ total: 3, broken: [{ text: 'zu Gleis 1/2', reason: 'Reparatur' }], unknown: [{ text: 'Aufzug 3' }] });
   });
 
+  it('leaves out the placeholder reason "not available"', () => {
+    const r = readElevators([{ equipmentnumber: 5, type: 'ELEVATOR', description: 'zu Gleis 1/2', state: 'INACTIVE', stateExplanation: 'not available' }]);
+    expect(r.broken).toEqual([{ text: 'zu Gleis 1/2' }]);
+  });
+
   it('goes from the name over the station number to the elevators, aligned', async () => {
     const urls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
